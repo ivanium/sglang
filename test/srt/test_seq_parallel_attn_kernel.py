@@ -2,8 +2,8 @@ import pytest
 import torch
 from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
-    BatchPrefillWithRaggedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
 )
 from flashinfer.cascade import merge_state
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
@@ -68,7 +68,7 @@ def test_seq_parallel_prefill(
             1,
         )
 
-        def iter0(i = 0): # SP worker 0 iter 0
+        def iter0(i=0):  # SP worker 0 iter 0
             q0 = q[:, i * qo_len_per_iter : (i + 1) * qo_len_per_iter]
             k0 = k[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
             v0 = v[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
@@ -79,9 +79,10 @@ def test_seq_parallel_prefill(
                 v0.contiguous().view(-1, num_kv_heads, head_dim),
             )
             return o00
+
         o00 = iter0()
 
-        def iter1(i = 1): # SP worker 0 iter 1
+        def iter1(i=1):  # SP worker 0 iter 1
             q1 = q[:, i * qo_len_per_iter : (i + 1) * qo_len_per_iter]
             k1 = k[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
             v1 = v[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
@@ -94,24 +95,35 @@ def test_seq_parallel_prefill(
 
             k0 = k[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
             v0 = v[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
-            kv_data0 = torch.zeros(batch_size * kv_len_per_partition, 2, num_kv_heads, head_dim).to(0).half()
+            kv_data0 = (
+                torch.zeros(
+                    batch_size * kv_len_per_partition, 2, num_kv_heads, head_dim
+                )
+                .to(0)
+                .half()
+            )
             kv_data0[:, 0] = k0.contiguous().view(-1, num_kv_heads, head_dim)
             kv_data0[:, 1] = v0.contiguous().view(-1, num_kv_heads, head_dim)
 
             o10, s10 = flashinfer_prefill_wrapper_paged.forward_return_lse(
-                q1.contiguous().view(-1, num_qo_heads, head_dim), kv_data0,
+                q1.contiguous().view(-1, num_qo_heads, head_dim),
+                kv_data0,
                 causal=False,
             )
             flashinfer_prefill_wrapper_paged.end_forward()
 
             o1, _ = merge_state(o10, s10, o11, s11)
             return o1
+
         o1 = iter1()
 
-        o = torch.cat([
+        o = torch.cat(
+            [
                 o00.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
                 o1.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
-            ], dim=1)
+            ],
+            dim=1,
+        )
         return o.view(-1, num_qo_heads, head_dim)
 
     def seq_parallel_worker_1_impl():
@@ -145,7 +157,7 @@ def test_seq_parallel_prefill(
             1,
         )
 
-        def iter0(i = 0): # SP worker 1 iter 0
+        def iter0(i=0):  # SP worker 1 iter 0
             q1 = q[:, (i + 1) * qo_len_per_iter : (i + 2) * qo_len_per_iter]
             k1 = k[:, (i + 1) * kv_len_per_partition : (i + 2) * kv_len_per_partition]
             v1 = v[:, (i + 1) * kv_len_per_partition : (i + 2) * kv_len_per_partition]
@@ -156,15 +168,18 @@ def test_seq_parallel_prefill(
                 v1.contiguous().view(-1, num_kv_heads, head_dim),
             )
             return o11, s11
+
         o11, s11 = iter0()
 
-        def iter1(i = 1): # SP worker 1 iter 1
+        def iter1(i=1):  # SP worker 1 iter 1
             q0 = q[:, (i - 1) * qo_len_per_iter : i * qo_len_per_iter]
             k0 = k[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
             v0 = v[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
 
             qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len_per_iter
-            kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
+            kv_indptr = (
+                torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
+            )
 
             o00 = flashinfer_prefill_wrapper_ragged.forward(
                 q0.contiguous().view(-1, num_qo_heads, head_dim),
@@ -173,12 +188,19 @@ def test_seq_parallel_prefill(
             )
 
             q1 = q[:, i * qo_len_per_iter : (i + 1) * qo_len_per_iter]
-            kv_data0 = torch.zeros(batch_size * kv_len_per_partition, 2, num_kv_heads, head_dim).to(0).half()
+            kv_data0 = (
+                torch.zeros(
+                    batch_size * kv_len_per_partition, 2, num_kv_heads, head_dim
+                )
+                .to(0)
+                .half()
+            )
             kv_data0[:, 0] = k0.contiguous().view(-1, num_kv_heads, head_dim)
             kv_data0[:, 1] = v0.contiguous().view(-1, num_kv_heads, head_dim)
 
             o10, s10 = flashinfer_prefill_wrapper_paged.forward_return_lse(
-                q1.contiguous().view(-1, num_qo_heads, head_dim), kv_data0,
+                q1.contiguous().view(-1, num_qo_heads, head_dim),
+                kv_data0,
                 causal=False,
             )
 
@@ -186,10 +208,13 @@ def test_seq_parallel_prefill(
 
         o00, o10, s10 = iter1()
         o1, _ = merge_state(o10, s10, o11, s11)
-        o = torch.cat([
-            o00.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
-            o1.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
-        ], dim=1)
+        o = torch.cat(
+            [
+                o00.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
+                o1.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
+            ],
+            dim=1,
+        )
         return o.view(-1, num_qo_heads, head_dim)
 
     def reference_impl_ragged():
@@ -254,7 +279,9 @@ def init_flashinfer(num_attention_heads, num_kv_heads):
     else:
         use_tensor_cores = False
 
-    workspace_buffer = torch.empty(3, 128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    workspace_buffer = torch.empty(
+        3, 128 * 1024 * 1024, dtype=torch.int8, device="cuda"
+    )
 
     global flashinfer_prefill_wrapper_ragged, flashinfer_prefill_wrapper_paged, flashinfer_decode_wrapper
 
