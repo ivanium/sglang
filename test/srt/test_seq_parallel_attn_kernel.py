@@ -42,27 +42,42 @@ def test_seq_parallel_prefill(
         qo_len_per_iter = qo_len // num_iters
         kv_len_per_partition = kv_len // num_partitions
 
+        qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len_per_iter
+        kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
+        flashinfer_prefill_wrapper_ragged.end_forward()
+        flashinfer_prefill_wrapper_ragged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+        )
+
+        kv_indices = torch.arange(0, batch_size * kv_len_per_partition).to(0).int()
+        kv_last_page_len = torch.full((batch_size,), 1, dtype=torch.int32).to(0)
+
+        flashinfer_prefill_wrapper_paged.end_forward()
+        flashinfer_prefill_wrapper_paged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+        )
+
         def iter0(i = 0): # SP worker 0 iter 0
             q0 = q[:, i * qo_len_per_iter : (i + 1) * qo_len_per_iter]
             k0 = k[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
             v0 = v[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
 
-            qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len_per_iter
-            kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
-            flashinfer_prefill_wrapper_ragged.end_forward()
-            flashinfer_prefill_wrapper_ragged.begin_forward(
-                qo_indptr,
-                kv_indptr,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-            )
             o00 = flashinfer_prefill_wrapper_ragged.forward(
                 q0.contiguous().view(-1, num_qo_heads, head_dim),
                 k0.contiguous().view(-1, num_kv_heads, head_dim),
                 v0.contiguous().view(-1, num_kv_heads, head_dim),
             )
-            flashinfer_prefill_wrapper_ragged.end_forward()
             return o00
         o00 = iter0()
 
@@ -71,24 +86,11 @@ def test_seq_parallel_prefill(
             k1 = k[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
             v1 = v[:, i * kv_len_per_partition : (i + 1) * kv_len_per_partition]
 
-            qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len_per_iter
-            kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
-
-            # TODO: we don't really need to re-setup ragged attention
-            flashinfer_prefill_wrapper_ragged.end_forward()
-            flashinfer_prefill_wrapper_ragged.begin_forward(
-                qo_indptr,
-                kv_indptr,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-            )
             o11, s11 = flashinfer_prefill_wrapper_ragged.forward_return_lse(
                 q1.contiguous().view(-1, num_qo_heads, head_dim),
                 k1.contiguous().view(-1, num_kv_heads, head_dim),
                 v1.contiguous().view(-1, num_kv_heads, head_dim),
             )
-            flashinfer_prefill_wrapper_ragged.end_forward()
 
             k0 = k[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
             v0 = v[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
@@ -96,20 +98,6 @@ def test_seq_parallel_prefill(
             kv_data0[:, 0] = k0.contiguous().view(-1, num_kv_heads, head_dim)
             kv_data0[:, 1] = v0.contiguous().view(-1, num_kv_heads, head_dim)
 
-            kv_indices = torch.arange(0, batch_size * kv_len_per_partition).to(0).int()
-            kv_last_page_len = torch.full((batch_size,), 1, dtype=torch.int32).to(0)
-
-            flashinfer_prefill_wrapper_paged.end_forward()
-            flashinfer_prefill_wrapper_paged.begin_forward(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_last_page_len,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                1,
-            )
             o10, s10 = flashinfer_prefill_wrapper_paged.forward_return_lse(
                 q1.contiguous().view(-1, num_qo_heads, head_dim), kv_data0,
                 causal=False,
@@ -118,8 +106,8 @@ def test_seq_parallel_prefill(
 
             o1, _ = merge_state(o10, s10, o11, s11)
             return o1
-
         o1 = iter1()
+
         o = torch.cat([
                 o00.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
                 o1.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
@@ -188,18 +176,18 @@ def init_flashinfer(num_attention_heads, num_kv_heads):
     else:
         use_tensor_cores = False
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    workspace_buffer = torch.empty(3, 128 * 1024 * 1024, dtype=torch.int8, device="cuda")
 
     global flashinfer_prefill_wrapper_ragged, flashinfer_prefill_wrapper_paged, flashinfer_decode_wrapper
 
     flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer, "NHD"
+        workspace_buffer[0], "NHD"
     )
     flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD"
+        workspace_buffer[1], "NHD"
     )
     flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD", use_tensor_cores=use_tensor_cores
+        workspace_buffer[2], "NHD", use_tensor_cores=use_tensor_cores
     )
 
 
@@ -207,3 +195,6 @@ if __name__ == "__main__":
     test_seq_parallel_prefill(12, 128, 128, 8, 8, 128)
     test_seq_parallel_prefill(12, 4096, 4096, 8, 8, 128)
     test_seq_parallel_prefill(12, 1024, 1024, 32, 32, 128)
+    # test_seq_parallel_prefill(12, 54, 37, 8, 8, 128)
+    # test_seq_parallel_prefill(37, 1111, 456, 32, 32, 128)
+    # test_seq_parallel_decode_(12, 54, 4, 32, 128)
