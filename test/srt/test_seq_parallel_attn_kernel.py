@@ -114,6 +114,84 @@ def test_seq_parallel_prefill(
             ], dim=1)
         return o.view(-1, num_qo_heads, head_dim)
 
+    def seq_parallel_worker_1_impl():
+        num_partitions = 2
+        num_iters = num_partitions
+        qo_len_per_iter = qo_len // num_iters
+        kv_len_per_partition = kv_len // num_partitions
+
+        qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len_per_iter
+        kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
+        flashinfer_prefill_wrapper_ragged.end_forward()
+        flashinfer_prefill_wrapper_ragged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+        )
+
+        kv_indices = torch.arange(0, batch_size * kv_len_per_partition).to(0).int()
+        kv_last_page_len = torch.full((batch_size,), 1, dtype=torch.int32).to(0)
+        flashinfer_prefill_wrapper_paged.end_forward()
+        flashinfer_prefill_wrapper_paged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+        )
+
+        def iter0(i = 0): # SP worker 1 iter 0
+            q1 = q[:, (i + 1) * qo_len_per_iter : (i + 2) * qo_len_per_iter]
+            k1 = k[:, (i + 1) * kv_len_per_partition : (i + 2) * kv_len_per_partition]
+            v1 = v[:, (i + 1) * kv_len_per_partition : (i + 2) * kv_len_per_partition]
+
+            o11, s11 = flashinfer_prefill_wrapper_ragged.forward_return_lse(
+                q1.contiguous().view(-1, num_qo_heads, head_dim),
+                k1.contiguous().view(-1, num_kv_heads, head_dim),
+                v1.contiguous().view(-1, num_kv_heads, head_dim),
+            )
+            return o11, s11
+        o11, s11 = iter0()
+
+        def iter1(i = 1): # SP worker 1 iter 1
+            q0 = q[:, (i - 1) * qo_len_per_iter : i * qo_len_per_iter]
+            k0 = k[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
+            v0 = v[:, (i - 1) * kv_len_per_partition : i * kv_len_per_partition]
+
+            qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len_per_iter
+            kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
+
+            o00 = flashinfer_prefill_wrapper_ragged.forward(
+                q0.contiguous().view(-1, num_qo_heads, head_dim),
+                k0.contiguous().view(-1, num_kv_heads, head_dim),
+                v0.contiguous().view(-1, num_kv_heads, head_dim),
+            )
+
+            q1 = q[:, i * qo_len_per_iter : (i + 1) * qo_len_per_iter]
+            kv_data0 = torch.zeros(batch_size * kv_len_per_partition, 2, num_kv_heads, head_dim).to(0).half()
+            kv_data0[:, 0] = k0.contiguous().view(-1, num_kv_heads, head_dim)
+            kv_data0[:, 1] = v0.contiguous().view(-1, num_kv_heads, head_dim)
+
+            o10, s10 = flashinfer_prefill_wrapper_paged.forward_return_lse(
+                q1.contiguous().view(-1, num_qo_heads, head_dim), kv_data0,
+                causal=False,
+            )
+
+            return o00, o10, s10
+
+        o00, o10, s10 = iter1()
+        o1, _ = merge_state(o10, s10, o11, s11)
+        o = torch.cat([
+            o00.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
+            o1.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim),
+        ], dim=1)
+        return o.view(-1, num_qo_heads, head_dim)
+
     def reference_impl_ragged():
         qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
         kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
@@ -162,7 +240,7 @@ def test_seq_parallel_prefill(
         flashinfer_prefill_wrapper_paged.end_forward()
         return o
 
-    o_sp = seq_parallel_worker_0_impl()
+    o_sp = seq_parallel_worker_1_impl()
     o_truth = reference_impl_paged()
 
     print("Mean: ", torch.mean(torch.abs(o_sp - o_truth)))
