@@ -119,7 +119,7 @@ def seq_parallel_attn(
         append_merge_partition(o_partitions[pid], o, s)
         # Paged attention computation for cross partition attention
         # NOTE: below schedule is for load balancing
-        for existing_pid in owned_pids[:-1]:
+        for existing_pid in owned_pids:
             if existing_pid == pid:
                 continue
             i, j = (existing_pid, pid) if existing_pid > pid else (pid, existing_pid)
