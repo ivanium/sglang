@@ -3,6 +3,7 @@
 import torch
 from flashinfer.cascade import merge_state
 from torch import nn
+from torch.distributed import P2POp, batch_isend_irecv, irecv, isend
 from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 
 from sglang.global_config import global_config
@@ -132,19 +133,36 @@ class RadixAttention(nn.Module):
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
-    def send_kv(self, k, v, my_rank, to_rank):
-        assert k.size() == v.size()
-        tp_group = get_tp_group()
-        tp_group.send_object(k.size(), to_rank)
-        tp_group.send(k, to_rank)
-        tp_group.send(v, to_rank)
+    def launch_sp_comm_ops(self, kv_to_recv, kv_to_send, from_rank, my_rank, to_rank):
+        def _send(handles, group):
+            if my_rank != to_rank:
+                for t in kv_to_send:
+                    handles.append(P2POp(op=isend, tensor=t, peer=to_rank, group=group))
 
-    def recv_kv(self, from_rank, dtype, kv_size):
-        tp_group = get_tp_group()
-        kv_size = tp_group.recv_object(from_rank)
-        k = tp_group.recv(kv_size, dtype, from_rank)
-        v = tp_group.recv(kv_size, dtype, from_rank)
-        return k, v
+        def _recv(handles, group):
+            if my_rank != from_rank:
+                for t in kv_to_recv:
+                    handles.append(
+                        P2POp(op=irecv, tensor=t, peer=from_rank, group=group)
+                    )
+
+        handles = []
+        reqs = []
+        tp_group = get_tp_group().device_group
+        # Interleaving workers for send and recv to avoid deadlock
+        if my_rank % 2 == 0:
+            _send(handles, tp_group)
+            _recv(handles, tp_group)
+        else:
+            _recv(handles, tp_group)
+            _send(handles, tp_group)
+        if handles:
+            reqs = batch_isend_irecv(handles)
+        return reqs
+
+    def wait_sp_comm_ops(self, reqs):
+        for req in reqs:
+            req.wait()
 
     def seq_parallel_extend_forward_triton(
         self, q, k, v, input_metadata: InputMetadata
@@ -159,6 +177,27 @@ class RadixAttention(nn.Module):
     def seq_parallel_extend_forward_flashinfer(
         self, q, k, v, input_metadata: InputMetadata
     ):
+        """Here we adopted a unique parallelization strategy.
+        For each SP worker, we have
+            q tensor: [batch_size, seq_len, q_head_num // SP_SIZE, head_dim]
+            k tensor: [batch_size, seq_len // SP_SIZE, k_head_num, head_dim]
+            v tensor: [batch_size, seq_len // SP_SIZE, v_head_num, head_dim]
+        """
+
+        def get_sp_seq_range(seq_len, sp_rank, sp_size):
+            sp_seq_len = seq_len // sp_size + ((seq_len % sp_size) > sp_rank)
+            stt = sp_rank * (seq_len // sp_size) + min(sp_rank, seq_len % sp_size)
+            end = stt + sp_seq_len
+            return stt, end
+
+        def get_k_shard_shape(batch_size, seq_len, sp_rank, sp_size):
+            sp_seq_len = seq_len // sp_size + ((seq_len % sp_size) > sp_rank)
+            return (batch_size * sp_seq_len, self.tp_k_head_num, self.head_dim)
+
+        def get_v_shard_shape(batch_size, seq_len, sp_rank, sp_size):
+            sp_seq_len = seq_len // sp_size + ((seq_len % sp_size) > sp_rank)
+            return (batch_size * sp_seq_len, self.tp_v_head_num, self.head_dim)
+
         def append_merge_shard(shard_list, o, s):
             if len(shard_list) == 0:
                 shard_list.append((o, s))
@@ -171,14 +210,14 @@ class RadixAttention(nn.Module):
         sp_size = get_sequence_parallel_world_size()
         num_shards = sp_size
         num_iters = sp_size
-        qo_len_per_iter = q.size(1) // num_iters
+        seq_len = q.size(1)
         batch_size = input_metadata.batch_size
 
         # FIXME: k and v should have been sharded and trimmed (padding tokens) so use them directly.
         local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
         local_v = v.contiguous().view(-1, self.tp_v_head_num, self.head_dim)
 
-        owned_pids = [rank]
+        owned_sids = [rank]
         owned_shards = [None for _ in range(num_shards)]
         owned_shards[rank] = (local_k, local_v)
         output_shards = [[] for _ in range(num_shards)]
@@ -186,17 +225,31 @@ class RadixAttention(nn.Module):
         # For communication
         to_rank = rank  # which SP worker to send my sequence KV shard to.
         from_rank = rank  # which SP worker to receive the sequence KV shard from.
-        pid = rank  # start from the worker's own shard
+        sid = rank  # start from the worker's own shard
         for _ in range(num_iters):
             to_rank = get_sequence_parallel_next_rank(to_rank)
             from_rank = get_sequence_parallel_prev_rank(from_rank)
-            # FIXME: send-recv communication here
-            # if rank != to_rank:
-            #     print("send", rank, to_rank)
-            #     self.send_kv(local_k, local_v, rank, to_rank)
-            #     print("send done", rank, to_rank)
-            q_shard = q[:, pid * qo_len_per_iter : (pid + 1) * qo_len_per_iter]
-            k_shard, v_shard = owned_shards[pid]
+            # Launch async communication operations
+            if rank != from_rank:
+                # reserve space for kv tensors received from other peers
+                owned_shards[from_rank] = (
+                    torch.empty(
+                        get_k_shard_shape(batch_size, seq_len, from_rank, sp_size),
+                        device=local_k.device,
+                        dtype=local_k.dtype,
+                    ),
+                    torch.empty(
+                        get_v_shard_shape(batch_size, seq_len, from_rank, sp_size),
+                        device=local_v.device,
+                        dtype=local_v.dtype,
+                    ),
+                )
+            comm_reqs = self.launch_sp_comm_ops(
+                owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
+            )
+            q_shard_stt, q_shard_end = get_sp_seq_range(seq_len, sid, sp_size)
+            q_shard = q[:, q_shard_stt:q_shard_end]
+            k_shard, v_shard = owned_shards[sid]
             # Ragged attention computation for self attention within the shard
             o, s = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
                 q_shard.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
@@ -206,17 +259,20 @@ class RadixAttention(nn.Module):
                 sm_scale=self.scaling,
                 logits_soft_cap=self.logit_cap,
             )
-            append_merge_shard(output_shards[pid], o, s)
+            append_merge_shard(output_shards[sid], o, s)
             # Paged attention computation for cross shard attention
-            # NOTE: below schedule is for load balancing
-            for existing_pid in owned_pids:
-                if existing_pid == pid:
+            # NOTE: below schedule is for load balancing. Basically, at iteration i,
+            # (i starting from 0), each SP worker will run i paged attentions.
+            for existing_sid in owned_sids:
+                if existing_sid == sid:
                     continue
+                # Due to the causal nature of the attention, swap pids if necessary
                 i, j = (
-                    (existing_pid, pid) if existing_pid > pid else (pid, existing_pid)
+                    (existing_sid, sid) if existing_sid > sid else (sid, existing_sid)
                 )
-                q_data = q[:, i * qo_len_per_iter : (i + 1) * qo_len_per_iter]
-                # FIXME: should store them into kv cache and use kv cache here.
+                q_shard_stt, q_shard_end = get_sp_seq_range(seq_len, i, sp_size)
+                q_data = q[:, q_shard_stt:q_shard_end]
+                # FIXME (yifan): should store them into kv cache and use kv cache here.
                 kv_data = torch.stack(owned_shards[j], dim=1)
                 o, s = (
                     input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
@@ -229,39 +285,22 @@ class RadixAttention(nn.Module):
                 )
                 append_merge_shard(output_shards[i], o, s)
 
-            # # FIXME: send-recv communication here
-            # if rank != from_rank:
-            #     print("recv", rank, from_rank)
-            #     kv_recved = self.recv_kv(from_rank, k.dtype)
-            #     owned_pids.append(pid)
-            #     owned_shards[pid] = kv_recved
-            # FIXME: here we applied a synchronous communication logic. Need to fix this.
-            if rank % 2 == 0:
-                if rank != to_rank:
-                    self.send_kv(local_k, local_v, rank, to_rank)
-                if rank != from_rank:
-                    kv_recved = self.recv_kv(from_rank, k.dtype, local_k.size())
-                    owned_pids.append(from_rank)
-                    owned_shards[from_rank] = kv_recved
-            else:
-                if rank != from_rank:
-                    kv_recved = self.recv_kv(from_rank, k.dtype, local_k.size())
-                    owned_pids.append(from_rank)
-                    owned_shards[from_rank] = kv_recved
-                if rank != to_rank:
-                    self.send_kv(local_k, local_v, rank, to_rank)
-            pid = from_rank
+            # Wait for async communication to complete
+            self.wait_sp_comm_ops(comm_reqs)
+            if rank != from_rank:
+                owned_sids.append(from_rank)
+            sid = from_rank
 
         # Reshape all o tensors so that we can concatenate along the sequence dimension
         # we must have len(shard_list) == 1 here
         os = [
-            o.view(batch_size, qo_len_per_iter, self.tp_q_head_num, self.head_dim)
+            o.view(batch_size, -1, self.tp_q_head_num, self.head_dim)
             for shard_list in output_shards
             for o, _ in shard_list
         ]
         o = torch.cat(os, dim=1)
 
-        # FIXME: enable kv cache storage after we supoprt it.
+        # FIXME (yifan): enable kv cache storage after we supoprt it.
         # self.store_kv_cache(k, v, input_metadata)
 
         # if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
