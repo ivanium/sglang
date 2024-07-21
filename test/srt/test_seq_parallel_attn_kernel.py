@@ -2,15 +2,11 @@ import multiprocessing
 import random
 
 import torch
-
 from vllm.distributed import init_distributed_environment
 
-import sys
-sys.path.append("/workspace/sglang/python")
-
-from sglang.srt.managers.controller.model_runner import InputMetadata
 from sglang.srt.layers.parallel_utils.parallel_state import initialize_model_parallel
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.controller.model_runner import InputMetadata
 
 NUM_HEADS = 8
 HEAD_DIM = 128
@@ -160,9 +156,13 @@ def sp_worker(rank: int = 0, sp_size: int = 1, tp_size: int = 1):
     output = attn.seq_parallel_extend_forward_flashinfer(q, k, v, input_metadata)
 
     o_truth = reference_attn()
-    o_truth = o_truth.contiguous().reshape(-1, NUM_HEADS, HEAD_DIM)[
-        :, rank * NUM_HEADS // sp_size : (rank + 1) * NUM_HEADS // sp_size
-    ].view(-1, NUM_HEADS // sp_size * HEAD_DIM)
+    o_truth = (
+        o_truth.contiguous()
+        .reshape(-1, NUM_HEADS, HEAD_DIM)[
+            :, rank * NUM_HEADS // sp_size : (rank + 1) * NUM_HEADS // sp_size
+        ]
+        .view(-1, NUM_HEADS // sp_size * HEAD_DIM)
+    )
     print("SP worker", rank, "results:")
     print("Mean: ", torch.mean(torch.abs(output - o_truth)))
     print("Max: ", torch.max(torch.abs(output - o_truth)))

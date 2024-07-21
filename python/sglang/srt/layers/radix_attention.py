@@ -3,14 +3,10 @@
 import torch
 from flashinfer.cascade import merge_state
 from torch import nn
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tp_group,
-)
+from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 
 from sglang.global_config import global_config
 from sglang.srt.layers.extend_attention import extend_attention_fwd
-
 from sglang.srt.layers.parallel_utils.parallel_state import (
     get_sequence_parallel_next_rank,
     get_sequence_parallel_prev_rank,
