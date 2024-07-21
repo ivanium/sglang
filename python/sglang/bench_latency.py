@@ -214,6 +214,7 @@ def latency_test(
     server_args,
     bench_args,
     tp_rank,
+    sp_rank=0,
 ):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
@@ -290,7 +291,7 @@ def main(server_args, bench_args):
         work_func = latency_test
 
     if server_args.tp_size == 1:
-        work_func(server_args, bench_args, 0)
+        work_func(server_args, bench_args, 0, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
