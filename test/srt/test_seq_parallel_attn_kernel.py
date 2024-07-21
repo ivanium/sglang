@@ -1,279 +1,211 @@
-import pytest
+import multiprocessing
+import random
+
 import torch
-from flashinfer import (
-    BatchDecodeWithPagedKVCacheWrapper,
-    BatchPrefillWithPagedKVCacheWrapper,
-    BatchPrefillWithRaggedKVCacheWrapper,
-)
-from flashinfer.cascade import merge_state
-from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 
-from sglang.srt.layers.extend_attention import extend_attention_fwd, redundant_attention
-from sglang.srt.layers.token_attention import token_attention_fwd
+from vllm.distributed import init_distributed_environment
 
-flashinfer_prefill_wrapper_ragged = None
-flashinfer_prefill_wrapper_paged = None
-flashinfer_decode_wrapper = None
+import sys
+sys.path.append("/workspace/sglang/python")
 
+from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.layers.parallel_utils.parallel_state import initialize_model_parallel
+from sglang.srt.layers.radix_attention import RadixAttention
 
-def get_next_partition_id(curr_partition_id, num_partitions):
-    assert curr_partition_id < num_partitions
-    return (curr_partition_id - 1) % num_partitions
+NUM_HEADS = 8
+HEAD_DIM = 128
+SCALING = 1
+NUM_KV_HEADS = 1
+LAYER_ID = 0
+LOGIT_CAP = -1
 
 
-def get_sp_prev_local_rank(rank, num_partitions):
-    return (rank - 1) % num_partitions
+BATCH_SIZE = 12
+QO_LEN = 1024
+KV_LEN = 1024
 
 
-def get_sp_next_local_rank(rank, num_partitions):
-    return (rank + 1) % num_partitions
+def gen_qkv(rank: int = 0, sp_size: int = 1):
+    torch.manual_seed(42)
+    random.seed(42)
+    q = torch.randn(BATCH_SIZE, QO_LEN, NUM_HEADS, HEAD_DIM).cuda().half()
+    k = torch.randn(BATCH_SIZE, KV_LEN, NUM_KV_HEADS, HEAD_DIM).cuda().half()
+    v = torch.randn(BATCH_SIZE, KV_LEN, NUM_KV_HEADS, HEAD_DIM).cuda().half()
+
+    num_heads_per_partition = NUM_HEADS // sp_size
+    q = q[
+        :, :, num_heads_per_partition * rank : num_heads_per_partition * (rank + 1)
+    ].contiguous()
+    kv_len_per_partition = KV_LEN // sp_size
+    k = k[
+        :, kv_len_per_partition * rank : kv_len_per_partition * (rank + 1)
+    ].contiguous()
+    v = v[
+        :, kv_len_per_partition * rank : kv_len_per_partition * (rank + 1)
+    ].contiguous()
+
+    return q, k, v
 
 
-def append_merge_partition(partition_list, o, s):
-    if len(partition_list) == 0:
-        partition_list.append((o, s))
-    else:
-        o_prev, s_prev = partition_list[-1]
-        o, s = merge_state(o_prev, s_prev, o, s)
-        partition_list[-1] = (o, s)
+def get_input_metadata(sp_size: int = 1, tp_size: int = 1):
+    from flashinfer import (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    )
 
+    input_metadata = InputMetadata(
+        forward_mode=None,
+        batch_size=BATCH_SIZE,
+        total_num_tokens=None,
+        req_pool_indices=None,
+        seq_lens=None,
+        positions=None,
+        req_to_token_pool=None,
+        token_to_kv_pool=None,
+        out_cache_loc=None,
+        extend_seq_lens=None,
+        extend_start_loc=None,
+        extend_no_prefix=True,
+        return_logprob=None,
+        top_logprobs_nums=None,
+        flashinfer_prefill_wrapper_ragged=None,
+        flashinfer_prefill_wrapper_paged=None,
+        flashinfer_decode_wrapper=None,
+    )
 
-def seq_parallel_attn(
-    batch_size,
-    kv_len,
-    qo_len,
-    num_kv_heads,
-    num_qo_heads,
-    head_dim,
-    q,
-    k,
-    v,
-    rank: int,
-    sp_size: int,
-):
-    """Simulate a sequence parallel attention kernel. It takes full Q, K, and V
-    with simulated communication. TODO: replace with actual communication.
-    """
-    num_partitions = sp_size
-    num_iters = sp_size
-    # NOTE: we assume sequence length is divisible by num_partitions
-    qo_len_per_iter = qo_len // num_iters
-    kv_len_per_partition = kv_len // num_partitions
+    workspace_buffer = torch.empty(
+        2, 128 * 1024 * 1024, dtype=torch.int8, device="cuda"
+    )
 
-    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len_per_iter
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len_per_partition
-    flashinfer_prefill_wrapper_ragged.end_forward()
-    flashinfer_prefill_wrapper_ragged.begin_forward(
+    input_metadata.flashinfer_prefill_wrapper_ragged = (
+        BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer[0], "NHD")
+    )
+    input_metadata.flashinfer_prefill_wrapper_paged = (
+        BatchPrefillWithPagedKVCacheWrapper(workspace_buffer[1], "NHD")
+    )
+
+    num_qo_heads = NUM_HEADS // sp_size
+    num_kv_heads = NUM_KV_HEADS
+    qo_len_per_iter = QO_LEN // sp_size
+    kv_len_per_partition = KV_LEN // sp_size
+
+    qo_indptr = torch.arange(0, BATCH_SIZE + 1).cuda().int() * qo_len_per_iter
+    kv_indptr = torch.arange(0, BATCH_SIZE + 1).cuda().int() * kv_len_per_partition
+    input_metadata.flashinfer_prefill_wrapper_ragged.end_forward()
+    input_metadata.flashinfer_prefill_wrapper_ragged.begin_forward(
         qo_indptr,
         kv_indptr,
         num_qo_heads,
         num_kv_heads,
-        head_dim,
+        HEAD_DIM,
     )
 
-    kv_indices = torch.arange(0, batch_size * kv_len_per_partition).to(0).int()
-    kv_last_page_len = torch.full((batch_size,), 1, dtype=torch.int32).to(0)
-    flashinfer_prefill_wrapper_paged.end_forward()
-    flashinfer_prefill_wrapper_paged.begin_forward(
+    # cached part
+    kv_indices = torch.arange(0, BATCH_SIZE * kv_len_per_partition).cuda().int()
+    kv_last_page_len = torch.full((BATCH_SIZE,), 1, dtype=torch.int32).cuda()
+    input_metadata.flashinfer_prefill_wrapper_paged.end_forward()
+    input_metadata.flashinfer_prefill_wrapper_paged.begin_forward(
         qo_indptr,
         kv_indptr,
         kv_indices,
         kv_last_page_len,
         num_qo_heads,
         num_kv_heads,
-        head_dim,
+        HEAD_DIM,
         1,
     )
 
-    local_k, local_v = (
-        k[:, rank * kv_len_per_partition : (rank + 1) * kv_len_per_partition]
-        .contiguous()
-        .view(-1, num_kv_heads, head_dim),
-        v[:, rank * kv_len_per_partition : (rank + 1) * kv_len_per_partition]
-        .contiguous()
-        .view(-1, num_kv_heads, head_dim),
-    )
-    k_partition, v_partition = local_k, local_v
+    return input_metadata
 
-    owned_pids = [rank]
-    owned_partitions = [None for _ in range(num_partitions)]
-    owned_partitions[rank] = (local_k, local_v)
-    o_partitions = [[] for _ in range(num_partitions)]
 
-    to_rank = rank  # which SP worker to send my sequence KV partition to.
-    from_rank = rank  # which SP worker to receive the sequence KV partition from.
+def sp_worker(rank: int = 0, sp_size: int = 1, tp_size: int = 1):
+    torch.manual_seed(42)
+    random.seed(42)
 
-    pid = rank  # start from the worker's own partition
-    for _ in range(num_iters):
-        # TODO: send-recv communication here
-        to_rank = get_sp_next_local_rank(to_rank, num_partitions)
-        # send_to(to_rank, k, v)
-        q_partition = q[:, pid * qo_len_per_iter : (pid + 1) * qo_len_per_iter]
-        k_partition, v_partition = owned_partitions[pid]
-        # Ragged attention computation for self attention within the partition
-        o, s = flashinfer_prefill_wrapper_ragged.forward_return_lse(
-            q_partition.contiguous().view(-1, num_qo_heads, head_dim),
-            k_partition.contiguous().view(-1, num_kv_heads, head_dim),
-            v_partition.contiguous().view(-1, num_kv_heads, head_dim),
+    def init_comm():
+        nccl_init_method = f"tcp://127.0.0.1:28888"
+        init_distributed_environment(
+            backend="nccl",
+            world_size=tp_size,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=nccl_init_method,
         )
-        append_merge_partition(o_partitions[pid], o, s)
-        # Paged attention computation for cross partition attention
-        # NOTE: below schedule is for load balancing
-        for existing_pid in owned_pids:
-            if existing_pid == pid:
-                continue
-            i, j = (existing_pid, pid) if existing_pid > pid else (pid, existing_pid)
-            q_data = q[:, i * qo_len_per_iter : (i + 1) * qo_len_per_iter]
-            kv_data = torch.stack(owned_partitions[j], dim=1)
-            o, s = flashinfer_prefill_wrapper_paged.forward_return_lse(
-                q_data.contiguous().view(-1, num_qo_heads, head_dim),
-                kv_data,
-                causal=False,
-            )
-            append_merge_partition(o_partitions[i], o, s)
-
-        # TODO: send-recv communication here
-        from_rank = get_sp_prev_local_rank(from_rank, num_partitions)
-        # recv_from(from_rank, k, v)
-        pid = from_rank
-        kv_recved = (
-            k[:, pid * kv_len_per_partition : (pid + 1) * kv_len_per_partition]
-            .contiguous()
-            .view(-1, num_kv_heads, head_dim),
-            v[:, pid * kv_len_per_partition : (pid + 1) * kv_len_per_partition]
-            .contiguous()
-            .view(-1, num_kv_heads, head_dim),
+        initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, sequence_parallel_size=sp_size
         )
-        owned_pids.append(pid)
-        owned_partitions[pid] = kv_recved
+        torch.cuda.set_device(rank)
 
-    # Reshape all o tensors so that we can concatenate along the sequence dimension
-    # we must have len(partition_list) == 1 here
-    os = [
-        o.view(batch_size, qo_len_per_iter, num_qo_heads, head_dim)
-        for partition_list in o_partitions
-        for o, _ in partition_list
-    ]
-    o = torch.cat(os, dim=1).view(
-        -1, num_qo_heads, head_dim
-    )  # restore the original shape
-    return o
+    init_comm()
 
-
-@pytest.mark.parametrize("batch_size", [12, 37, 67])
-@pytest.mark.parametrize("kv_len", [54, 97])
-@pytest.mark.parametrize("qo_len", [37, 17])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [32, 4])
-@pytest.mark.parametrize("head_dim", [128])
-def test_seq_parallel_prefill(
-    batch_size,
-    kv_len,
-    qo_len,
-    num_kv_heads,
-    num_qo_heads,
-    head_dim,
-    rank: int = 0,
-    sp_size: int = 2,
-):
-    init_flashinfer(num_qo_heads, num_kv_heads)
-
-    q = torch.randn(batch_size, qo_len, num_qo_heads, head_dim).to(0).half()
-    k = torch.randn(batch_size, kv_len, num_kv_heads, head_dim).to(0).half()
-    v = torch.randn(batch_size, kv_len, num_kv_heads, head_dim).to(0).half()
-
-    def reference_impl_ragged():
-        qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
-        kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
-
-        flashinfer_prefill_wrapper_ragged.end_forward()
-        flashinfer_prefill_wrapper_ragged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
+    def init_attention():
+        attention = RadixAttention(
+            num_heads=NUM_HEADS // sp_size,
+            head_dim=HEAD_DIM,
+            scaling=SCALING,
+            num_kv_heads=NUM_KV_HEADS,
+            layer_id=LAYER_ID,
+            logit_cap=LOGIT_CAP,
         )
-        o = flashinfer_prefill_wrapper_ragged.forward(
-            q.contiguous().view(-1, num_qo_heads, head_dim),
-            k.contiguous().view(-1, num_kv_heads, head_dim),
-            v.contiguous().view(-1, num_kv_heads, head_dim),
-        )
-        flashinfer_prefill_wrapper_ragged.end_forward()
-        return o
+        return attention
 
-    def reference_impl_paged():
-        qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
-        total_tokens = kv_len * batch_size
+    attn = init_attention()
+    print("SP worker", rank, "initialized on", torch.cuda.current_device())
 
-        kv_data = torch.zeros(total_tokens, 2, num_kv_heads, head_dim).to(0).half()
-        kv_data[:, 0] = k.contiguous().view(-1, num_kv_heads, head_dim)
-        kv_data[:, 1] = v.contiguous().view(-1, num_kv_heads, head_dim)
-        kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
-        kv_indices = torch.arange(0, total_tokens).to(0).int()
-        kv_last_page_len = torch.full((batch_size,), 1, dtype=torch.int32).to(0)
+    # Computation
+    input_metadata = get_input_metadata(sp_size=sp_size, tp_size=tp_size)
+    q, k, v = gen_qkv(rank, sp_size)
+    _, k_other, v_other = gen_qkv((rank + 1) % sp_size, sp_size)
 
-        flashinfer_prefill_wrapper_paged.end_forward()
-        flashinfer_prefill_wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            1,
-        )
-        o = flashinfer_prefill_wrapper_paged.forward(
-            q.contiguous().view(-1, num_qo_heads, head_dim), kv_data
-        )
-        flashinfer_prefill_wrapper_paged.end_forward()
-        return o
+    output = attn.seq_parallel_extend_forward_flashinfer(q, k, v, input_metadata)
 
-    o_sp = seq_parallel_attn(
-        batch_size,
-        kv_len,
-        qo_len,
-        num_kv_heads,
-        num_qo_heads,
-        head_dim,
-        q,
-        k,
-        v,
-        rank=1,
-        sp_size=4,
-    )
-    o_truth = reference_impl_paged()
-
-    print("Mean: ", torch.mean(torch.abs(o_sp - o_truth)))
-    print("Max: ", torch.max(torch.abs(o_sp - o_truth)))
-    assert torch.allclose(o_sp, o_truth, rtol=1e-2, atol=1e-3)
+    o_truth = reference_attn()
+    o_truth = o_truth.contiguous().reshape(-1, NUM_HEADS, HEAD_DIM)[
+        :, rank * NUM_HEADS // sp_size : (rank + 1) * NUM_HEADS // sp_size
+    ].view(-1, NUM_HEADS // sp_size * HEAD_DIM)
+    print("SP worker", rank, "results:")
+    print("Mean: ", torch.mean(torch.abs(output - o_truth)))
+    print("Max: ", torch.max(torch.abs(output - o_truth)))
+    assert torch.allclose(output, o_truth, rtol=1e-2, atol=1e-3)
 
 
-def init_flashinfer(num_attention_heads, num_kv_heads):
-    if not _grouped_size_compiled_for_decode_kernels(num_attention_heads, num_kv_heads):
-        use_tensor_cores = True
-    else:
-        use_tensor_cores = False
+def reference_attn():
+    torch.manual_seed(42)
+    random.seed(42)
 
-    workspace_buffer = torch.empty(
-        3, 128 * 1024 * 1024, dtype=torch.int8, device="cuda"
+    attn = RadixAttention(
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        scaling=SCALING,
+        num_kv_heads=NUM_KV_HEADS,
+        layer_id=LAYER_ID,
+        logit_cap=LOGIT_CAP,
     )
 
-    global flashinfer_prefill_wrapper_ragged, flashinfer_prefill_wrapper_paged, flashinfer_decode_wrapper
+    input_metadata = get_input_metadata()
+    q, k, v = gen_qkv()
 
-    flashinfer_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer[0], "NHD"
-    )
-    flashinfer_prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer[1], "NHD"
-    )
-    flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer[2], "NHD", use_tensor_cores=use_tensor_cores
-    )
+    return attn.extend_forward_flashinfer(q, k, v, input_metadata)
+
+
+def main():
+    sp_size = 2
+    tp_size = 2
+
+    multiprocessing.set_start_method("spawn", force=True)
+    sp_procs = []
+    for rank in range(1, sp_size):
+        sp_proc = multiprocessing.Process(
+            target=sp_worker, args=(rank, sp_size, tp_size)
+        )
+        sp_proc.start()
+        sp_procs.append(sp_proc)
+
+    output = sp_worker(0, sp_size, tp_size)
+
+    for sp_proc in sp_procs:
+        sp_proc.join()
 
 
 if __name__ == "__main__":
-    test_seq_parallel_prefill(12, 128, 128, 8, 8, 128, rank=3, sp_size=4)
-    test_seq_parallel_prefill(12, 4096, 4096, 8, 8, 128, rank=4, sp_size=8)
-    test_seq_parallel_prefill(12, 1024, 1024, 32, 32, 128, rank=1, sp_size=2)
+    main()
