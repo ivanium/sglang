@@ -610,7 +610,7 @@ class Batch:
             if len(flatten_ids) < padded_sp_len:
                 flatten_ids.extend([0] * (padded_sp_len - len(flatten_ids)))
         self.padded_sp_len = padded_sp_len
-        
+
         input_ids = itertools.chain(input_ids_sp)
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.prefix_lens = None
@@ -794,9 +794,9 @@ class InputMetadata:
     # For Sequence Parallel
     sp_rank: int = None
     sp_size: int = None
-    local_token_indices: np.ndarray
-    sp_to_normal_indices: np.ndarray
-    sp_local_token_length: int
+    local_token_indices: np.ndarray = None
+    sp_to_normal_indices: np.ndarray = None
+    sp_local_token_length: int = None
 
     @classmethod
     def create(
