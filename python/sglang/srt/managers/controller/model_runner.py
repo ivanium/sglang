@@ -17,15 +17,12 @@ from flashinfer import (
 from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
-from vllm.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from vllm.distributed import get_tp_group, init_distributed_environment
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
+from sglang.srt.layers.parallel_utils.parallel_state import initialize_model_parallel
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs
@@ -83,7 +80,10 @@ class ModelRunner:
             local_rank=self.gpu_id,
             distributed_init_method=nccl_init_method,
         )
-        initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+        initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            sequence_parallel_size=self.sp_size,
+        )
         self.tp_group = get_tp_group()
         total_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
