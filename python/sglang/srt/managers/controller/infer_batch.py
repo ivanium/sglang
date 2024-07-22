@@ -1,9 +1,9 @@
 """Meta data for requests and batches"""
 
-import itertools
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
+import itertools
 from typing import Iterable, List, Optional, Union
 
 import numpy as np
@@ -369,7 +369,7 @@ class Batch:
         for flatten_ids in flatten_input_ids:
             if len(flatten_ids) < padded_sp_len:
                 flatten_ids.extend([0] * (padded_sp_len - len(flatten_ids)))
-        flatten_input_ids = list(itertools.chain(flatten_input_ids))
+        flatten_input_ids = list(itertools.chain(*flatten_input_ids))
         self.padded_sp_len = padded_sp_len
 
         position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
@@ -599,11 +599,11 @@ class Batch:
             ]
         self.seq_lens.add_(1)
         input_ids_sp = [[] for _ in range(self.sp_size)]
-        prefix_lens = self.prefix_lens or 0
+        prefix_lens = 0 if self.prefix_lens is None else self.prefix_lens
         seq_lens_cpu = (self.seq_lens - prefix_lens).cpu().numpy()
         for sp_rank in range(self.sp_size):
             # TODO(yonghao): double check moving the seq lens adds one to above.
-            input_ids_sp[sp_rank].append(input_ids[
+            input_ids_sp[sp_rank].extend(input_ids[
                 get_decode_indices(sp_rank, self.sp_size, seq_lens_cpu)
             ])
         padded_sp_len = max(len(ids) for ids in input_ids_sp)
@@ -612,7 +612,7 @@ class Batch:
                 flatten_ids.extend([0] * (padded_sp_len - len(flatten_ids)))
         self.padded_sp_len = padded_sp_len
 
-        input_ids = list(itertools.chain(input_ids_sp))
+        input_ids = list(itertools.chain(*input_ids_sp))
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.prefix_lens = None
 
@@ -864,6 +864,7 @@ class InputMetadata:
             # FIXME: haven't supported cuda graph yet.
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
+            prefix_lens = prefix_lens if prefix_lens is not None else 0
             extend_seq_lens_cpu = (seq_lens - prefix_lens).cpu().numpy()
             if forward_mode == ForwardMode.DECODE:
                 local_token_indices = get_decode_indices(sp_rank, sp_size,
@@ -1100,13 +1101,13 @@ def _debug_normal_to_sp_indices(mode, sp_size, seq_lens, sp_padded_len):
     """(Debug only) Indices from normal layout to the SP layout (padded)."""
     get_indices_fn = (get_decode_indices
                       if mode == ForwardMode.DECODE else get_prefill_indices)
-    def get_offset(sp_rank):
-        offset = sp_rank * sp_padded_len
-        if mode == ForwardMode.DECODE:
-            return offset
-        return [offset] * len(seq_lens)
+    offset = (0
+              if mode == ForwardMode.DECODE else
+              np.concatenate([np.asarray([0], dtype=np.int32),
+                              np.cumsum(seq_lens[:-1])])
+             )
     indices = [
-        get_indices_fn(sp_rank, sp_size, seq_lens, get_offset(sp_rank))
+        get_indices_fn(sp_rank, sp_size, seq_lens, offset)
         for sp_rank in range(sp_size)
     ]
     return indices
