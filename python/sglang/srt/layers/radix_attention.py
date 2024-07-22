@@ -92,6 +92,9 @@ class RadixAttention(nn.Module):
         return o
 
     def extend_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+        if input_metadata.sp_size > 1:
+            return self.seq_parallel_extend_forward_flashinfer(q, k, v, input_metadata)
+
         o1, s1 = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
             q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
             k.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
