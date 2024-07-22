@@ -220,6 +220,7 @@ class RadixAttention(nn.Module):
         # Because we haven't partitioned k and v along the sequence dimension
         # (dim 0 in k and v tensors), here we manually select the corresponding
         # shard for simulation.
+        q = q.view(-1, self.tp_q_head_num, self.head_dim)
         k = k[rank]
         v = v[rank]
 
