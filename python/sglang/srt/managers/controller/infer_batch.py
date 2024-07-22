@@ -1,9 +1,9 @@
 """Meta data for requests and batches"""
 
+import itertools
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-import itertools
 from typing import Iterable, List, Optional, Union
 
 import numpy as np
@@ -860,9 +860,11 @@ class InputMetadata:
         sp_rank = model_runner.sp_rank
         sp_size = model_runner.sp_size
         if sp_size > 1:
+            # FIXME: haven't supported cuda graph yet.
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
             extend_seq_lens_cpu = (seq_lens - prefix_lens).cpu().numpy()
+            extend_start_loc_cpu = extend_start_loc.cpu().numpy()
             if forward_mode == ForwardMode.DECODE:
                 local_token_indices = get_decode_indices(sp_rank, sp_size,
                                                          extend_seq_lens_cpu)
@@ -871,7 +873,8 @@ class InputMetadata:
                 )
             else:
                 local_token_indices = get_prefill_indices(sp_rank, sp_size,
-                                                          extend_seq_lens_cpu)
+                                                          extend_seq_lens_cpu,
+                                                          extend_start_loc_cpu)
                 sp_to_normal_indices = sp_to_normal_indices_prefill(
                     sp_size, extend_seq_lens_cpu, padded_sp_len
                 )
@@ -926,7 +929,9 @@ def init_flashinfer_args(
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
-    num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size)
+    # NOTE (yifan): we partitioned K and V along both TP and SP dimensions.
+    # And here tp_size represents actual TP size * SP size.
+    num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size // model_runner.sp_size)
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
 
