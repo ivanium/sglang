@@ -935,6 +935,10 @@ def init_flashinfer_args(
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
 
+    # FIXME (yifan): these are hardcoded values for debugging. Fix them use the real layout.
+    seq_lens = seq_lens // model_runner.sp_size
+    prefix_lens = prefix_lens // model_runner.sp_size
+
     if forward_mode == ForwardMode.DECODE:
         paged_kernel_lens = seq_lens
     else:

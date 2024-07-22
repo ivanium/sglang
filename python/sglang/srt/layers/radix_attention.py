@@ -182,9 +182,9 @@ class RadixAttention(nn.Module):
     ):
         """Here we adopted a unique parallelization strategy.
         For each SP worker, we have
-            q tensor: [batch_size, seq_len, q_head_num // SP_SIZE, head_dim]
-            k tensor: [batch_size, seq_len // SP_SIZE, k_head_num, head_dim]
-            v tensor: [batch_size, seq_len // SP_SIZE, v_head_num, head_dim]
+            q tensor: [batch_size * seq_len, q_head_num // SP_SIZE, head_dim]
+            k tensor: [batch_size * seq_len // SP_SIZE, k_head_num, head_dim]
+            v tensor: [batch_size * seq_len // SP_SIZE, v_head_num, head_dim]
         """
 
         def get_sp_seq_range(seq_len, sp_rank, sp_size):
@@ -213,8 +213,15 @@ class RadixAttention(nn.Module):
         sp_size = get_sequence_parallel_world_size()
         num_shards = sp_size
         num_iters = sp_size
-        seq_len = q.size(1)
         batch_size = input_metadata.batch_size
+        # FIXME (yifan): Below are hardcoded for debugging purpose. Should fix
+        # this with correct layout.
+        seq_len = q.size(0) * q.size(1)
+        # Because we haven't partitioned k and v along the sequence dimension
+        # (dim 0 in k and v tensors), here we manually select the corresponding
+        # shard for simulation.
+        k = k[rank]
+        v = v[rank]
 
         # FIXME: k and v should have been sharded and trimmed (padding tokens) so use them directly.
         local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
@@ -251,7 +258,7 @@ class RadixAttention(nn.Module):
                 owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
             )
             q_shard_stt, q_shard_end = get_sp_seq_range(seq_len, sid, sp_size)
-            q_shard = q[:, q_shard_stt:q_shard_end]
+            q_shard = q[q_shard_stt:q_shard_end]
             k_shard, v_shard = owned_shards[sid]
             # Ragged attention computation for self attention within the shard
             o, s = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
@@ -274,7 +281,7 @@ class RadixAttention(nn.Module):
                     (existing_sid, sid) if existing_sid > sid else (sid, existing_sid)
                 )
                 q_shard_stt, q_shard_end = get_sp_seq_range(seq_len, i, sp_size)
-                q_data = q[:, q_shard_stt:q_shard_end]
+                q_data = q[q_shard_stt:q_shard_end]
                 # FIXME (yifan): should store them into kv cache and use kv cache here.
                 kv_data = torch.stack(owned_shards[j], dim=1)
                 o, s = (
@@ -293,15 +300,11 @@ class RadixAttention(nn.Module):
             if rank != from_rank:
                 owned_sids.append(from_rank)
             sid = from_rank
-
+        # TODO(yifan): double check this
         # Reshape all o tensors so that we can concatenate along the sequence dimension
         # we must have len(shard_list) == 1 here
-        os = [
-            o.view(batch_size, -1, self.tp_q_head_num, self.head_dim)
-            for shard_list in output_shards
-            for o, _ in shard_list
-        ]
-        o = torch.cat(os, dim=1)
+        os = [o for shard_list in output_shards for o, _ in shard_list]
+        o = torch.cat(os, dim=0)
 
         # FIXME (yifan): enable kv cache storage after we supoprt it.
         # self.store_kv_cache(k, v, input_metadata)
