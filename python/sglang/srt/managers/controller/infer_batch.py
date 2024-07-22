@@ -947,18 +947,24 @@ def init_flashinfer_args(
 
     kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-    req_pool_indices_cpu = req_pool_indices.cpu().numpy()
-    paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
-    kv_indices = torch.cat(
-        [
-            model_runner.req_to_token_pool.req_to_token[
-                req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
-            ]
-            for i in range(batch_size)
-        ],
-        dim=0,
-    ).contiguous()
-    kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
+    # FIXME (yifan): dirty hack for now. With sequence parallel, we will use flashinfer
+    # paged attn kernel for extend phase as well, and we manually initialize kv_indices
+    # here and avoid write to KV cache. Should revise here after having KV cache support.
+    if forward_mode == ForwardMode.DECODE:
+        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+        paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+        kv_indices = torch.cat(
+            [
+                model_runner.req_to_token_pool.req_to_token[
+                    req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
+                ]
+                for i in range(batch_size)
+            ],
+            dim=0,
+        ).contiguous()
+    else:
+        kv_indices = torch.arange(0, torch.sum(seq_lens), dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
     if forward_mode == ForwardMode.DECODE:
         flashinfer_decode_wrapper.end_forward()

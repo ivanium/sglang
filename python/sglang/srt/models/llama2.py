@@ -31,6 +31,8 @@ from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.parallel_utils.parallel_state import (
     get_actual_tensor_model_parallel_world_size,
+    get_sequence_parallel_local_rank,
+    get_sequence_parallel_world_size,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
@@ -110,6 +112,11 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        # FIXME (yifan): only used for reshaping q tensor. Remove them once we fix q_proj
+        self.sp_rank = get_sequence_parallel_local_rank()
+        self.sp_size = get_sequence_parallel_world_size()
+        self.sp_hidden_size = hidden_size // self.sp_size
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -153,6 +160,10 @@ class LlamaAttention(nn.Module):
         q, _ = self.rotary_emb(positions, q, q)
         _, k = self.rotary_emb(positions, k, k)
         # q, k = self.rotary_emb(positions, q, k)
+        # FIXME (yifan): hardcoded for now. Should fix q_proj to avoid all gather
+        # and q.shape should be [sp_size, token_num_per_sp, num_heads_per_sp * head_dim]
+        q = q.view(-1, self.hidden_size)
+        q = q[:,self.sp_rank * self.sp_hidden_size:(self.sp_rank + 1) * self.sp_hidden_size]
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output

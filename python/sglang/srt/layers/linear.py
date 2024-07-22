@@ -80,6 +80,9 @@ class QKVParallelLinear(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
+        # FIXME (yifan): output_size should be head_size * total_num_heads // sp_size.
+        # We probably need to manually partition the q_proj in this case since RowPrallelLinear
+        # will perform all-gather after the computation.
         # q projection can be naively tensor parallelized
         self.q_proj = RowParallelLinear(
             hidden_size,
