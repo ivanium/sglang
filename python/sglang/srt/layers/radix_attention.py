@@ -220,8 +220,9 @@ class RadixAttention(nn.Module):
         # FIXME (yifan): Because we haven't partitioned k and v along the sequence dimension
         # (dim 0 in k and v tensors), here we manually select the corresponding
         # shard for simulation.
-        k = k[rank,:,:]
-        v = v[rank,:,:]
+        orig_k, orig_v = k, v
+        k = k[rank, :, :]
+        v = v[rank, :, :]
 
         # FIXME: k and v should have been sharded and trimmed (padding tokens) so use them directly.
         local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
@@ -242,23 +243,33 @@ class RadixAttention(nn.Module):
             # Launch async communication operations
             if rank != from_rank:
                 # reserve space for kv tensors received from other peers
+                # FIXME (yifan): this is a dirty hack. Should use communication to get kv tensors as below.
                 owned_shards[from_rank] = (
-                    torch.empty(
-                        get_k_shard_shape(token_num, from_rank, sp_size),
-                        device=local_k.device,
-                        dtype=local_k.dtype,
-                    ),
-                    torch.empty(
-                        get_v_shard_shape(token_num, from_rank, sp_size),
-                        device=local_v.device,
-                        dtype=local_v.dtype,
-                    ),
+                    orig_k[from_rank, :, :]
+                    .contiguous()
+                    .view(-1, self.tp_k_head_num, self.head_dim),
+                    orig_v[from_rank, :, :]
+                    .contiguous()
+                    .view(-1, self.tp_k_head_num, self.head_dim),
                 )
-            comm_reqs = self.launch_sp_comm_ops(
-                owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
-            )
+                # owned_shards[from_rank] = (
+                #     torch.empty(
+                #         get_k_shard_shape(token_num, from_rank, sp_size),
+                #         device=local_k.device,
+                #         dtype=local_k.dtype,
+                #     ),
+                #     torch.empty(
+                #         get_v_shard_shape(token_num, from_rank, sp_size),
+                #         device=local_v.device,
+                #         dtype=local_v.dtype,
+                #     ),
+                # )
+            # FIXME (yifan): somehow communication will hang. Re-enable this after fixing it.
+            # comm_reqs = self.launch_sp_comm_ops(
+            #     owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
+            # )
             q_shard_stt, q_shard_end = get_sp_seq_range(token_num, sid, sp_size)
-            q_shard = q[q_shard_stt:q_shard_end,:,:]
+            q_shard = q[q_shard_stt:q_shard_end, :, :]
             k_shard, v_shard = owned_shards[sid]
             # Ragged attention computation for self attention within the shard
             o, s = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
@@ -296,7 +307,8 @@ class RadixAttention(nn.Module):
                 append_merge_shard(output_shards[i], o, s)
 
             # Wait for async communication to complete
-            self.wait_sp_comm_ops(comm_reqs)
+            # FIXME (yifan): re-enable communication after fixing the bug.
+            # self.wait_sp_comm_ops(comm_reqs)
             if rank != from_rank:
                 owned_sids.append(from_rank)
             sid = from_rank
