@@ -17,7 +17,6 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -28,7 +27,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.parallel_utils.parallel_state import (
+    get_actual_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 
@@ -83,20 +86,23 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        # This is TP_SIZE * SP_SIZE
         tp_size = get_tensor_model_parallel_world_size()
+        # This is the actual TP size
+        actual_tp_size = get_actual_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
+        if self.total_num_kv_heads >= actual_tp_size:
+            # Number of KV heads is greater than actual TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % actual_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert actual_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // actual_tp_size)
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -141,9 +147,12 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k, v = self.qkv_proj(hidden_states)
+        # FIXME (yifan): q and k have different shape here so we need to adapt
+        # the positional embedding part.. Currently this is a quite dirty hack.
+        q, _ = self.rotary_emb(positions, q, q)
+        _, k = self.rotary_emb(positions, k, k)
+        # q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output
@@ -291,11 +300,14 @@ class LlamaForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
+            ("qkv_proj.kv_proj", "k_proj", "k"),
+            ("qkv_proj.kv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+        ]
+        renamed_params_mapping = [
+            # (param_name, weight_name)
+            ("qkv_proj.q_proj", "q_proj"),
         ]
         params_dict = dict(self.named_parameters())
         if get_tensor_model_parallel_rank() == 0:
@@ -326,6 +338,10 @@ class LlamaForCausalLM(nn.Module):
                     continue
                 if name.startswith("model.vision_tower") and name not in params_dict:
                     continue
+                for param_name, weight_name in renamed_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
