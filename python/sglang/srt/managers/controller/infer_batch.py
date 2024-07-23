@@ -949,7 +949,9 @@ def init_flashinfer_args(
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
     # NOTE (yifan): we partitioned K and V along both TP and SP dimensions.
     # And here tp_size represents actual TP size * SP size.
-    num_kv_heads = model_runner.model_config.get_num_kv_heads(model_runner.tp_size // model_runner.sp_size)
+    num_kv_heads = model_runner.model_config.get_num_kv_heads(
+        model_runner.tp_size // model_runner.sp_size
+    )
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
 
@@ -980,7 +982,9 @@ def init_flashinfer_args(
             dim=0,
         ).contiguous()
     else:
-        kv_indices = torch.arange(0, torch.sum(seq_lens), dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(
+            0, torch.sum(seq_lens), dtype=torch.int32, device="cuda"
+        )
         kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
     if forward_mode == ForwardMode.DECODE:

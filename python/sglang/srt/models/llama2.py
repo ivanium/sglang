@@ -169,7 +169,12 @@ class LlamaAttention(nn.Module):
         # FIXME (yifan): hardcoded for now. Should fix q_proj to avoid all gather
         # and q.shape should be [sp_size, token_num_per_sp, num_heads_per_sp * head_dim]
         q = q.view(-1, self.hidden_size)
-        q = q[:,self.sp_rank * self.sp_hidden_size:(self.sp_rank + 1) * self.sp_hidden_size]
+        q = q[
+            :,
+            self.sp_rank
+            * self.sp_hidden_size : (self.sp_rank + 1)
+            * self.sp_hidden_size,
+        ]
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         if input_metadata.sp_size > 1:
