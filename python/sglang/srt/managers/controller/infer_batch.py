@@ -355,14 +355,20 @@ class Batch:
             )
 
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
-        num_padding_tokens = _get_num_padding_tokens(self.sp_size, [
-            len(ids) for ids in input_ids
-        ])
+        num_padding_tokens = _get_num_padding_tokens(
+            self.sp_size, np.asarray([len(ids) for ids in input_ids])
+        )
         for i in range(bs):
             for sp_rank in range(self.sp_size):
                 ids = input_ids[i]
-                local_slice = _get_local_token_slices_new(sp_rank, self.sp_size, len(ids))
-                flatten_input_ids[sp_rank].extend(ids[local_slice])
+                local_slice = _get_local_token_slices_new(
+                    sp_rank, self.sp_size, len(ids)
+                )
+                try:
+                    flatten_input_ids[sp_rank].extend(ids[local_slice])
+                except TypeError as e:
+                    print(local_slice, sp_rank, self.sp_size, len(ids))
+                    raise e
             flatten_input_ids[-1].extend([0] * num_padding_tokens[i])
             extend_lens.append(len(input_ids[i]))
 
@@ -882,20 +888,25 @@ class InputMetadata:
                     sp_size, extend_seq_lens_cpu, padded_sp_len
                 )
                 _debug_normal_to_sp_metadata = _debug_normal_to_sp_indices_decode(
-                    forward_mode, sp_size, extend_seq_lens_cpu
+                    sp_size, extend_seq_lens_cpu
                 )
+                sp_local_token_length = get_decode_indices(
+                    sp_rank, sp_size, extend_seq_lens_cpu
+                ).size
             else:
                 sp_to_normal_indices = sp_to_normal_indices_prefill(
                     sp_size, extend_seq_lens_cpu
                 )
                 _debug_normal_to_sp_metadata = _debug_normal_to_sp_indices_prefill(
-                    forward_mode, sp_size, extend_seq_lens_cpu
+                    sp_size, extend_seq_lens_cpu
+                )
+                sp_local_token_length = _get_local_token_nums_new(
+                    sp_rank, sp_size, extend_seq_lens_cpu
                 )
         else:
-            local_token_indices = np.arange(positions.numel())
             sp_to_normal_indices = np.arange(positions.numel())
             _debug_normal_to_sp_metadata = None
-        sp_local_token_length = len(local_token_indices)
+            sp_local_token_length = positions.numel()
 
         ret = cls(
             forward_mode=forward_mode,
@@ -1022,44 +1033,51 @@ def init_triton_args(forward_mode, seq_lens, prefix_lens):
     return max_seq_len, max_extend_len, start_loc, prefix_lens
 
 
-def _get_local_token_nums_new(sp_rank, sp_size, extend_seq_lens: Union[int, np.ndarray]):
+def _get_local_token_nums_new(
+    sp_rank, sp_size, extend_seq_lens: Union[int, np.ndarray]
+):
     """Get the number of tokens in this SP. Padding is not considered."""
-    padded_size = np.ceil(extend_seq_lens / sp_size)
-    return (padded_size if sp_rank != sp_size - 1
-            else extend_seq_lens - (sp_size - 1) * padded_size)
+    padded_size = np.ceil(extend_seq_lens / sp_size).astype(np.int32)
+    return (
+        padded_size
+        if sp_rank != sp_size - 1
+        else extend_seq_lens - (sp_size - 1) * padded_size
+    )
 
 
 def _get_num_padding_tokens(sp_size, extend_seq_lens: np.ndarray):
     """Get the number of tokens padded for SP."""
-    padded_size = np.ceil(extend_seq_lens / sp_size)
+    padded_size = np.ceil(extend_seq_lens / sp_size).astype(np.int32)
     return sp_size * padded_size - extend_seq_lens
 
 
-def get_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray, offset=0):
+def get_decode_indices(sp_rank, sp_size, seq_lens: np.ndarray):
     """Get Indices from the normal layout to the sequence parallel layout."""
-    return np.nonzero((seq_lens % sp_size) == sp_rank)[0] + offset
+    return np.nonzero((seq_lens % sp_size) == sp_rank)[0]
 
 
 def _get_local_token_slices_new(sp_rank, sp_size, seq_len: int):
     """Get the SP local slice for a single request's extended input ids."""
-    start = np.ceil(seq_len / sp_size) * sp_rank
+    start = int(np.ceil(seq_len / sp_size) * sp_rank)
     length = _get_local_token_nums_new(sp_rank, sp_size, seq_len)
     return slice(start, start + length)
 
 
-def sp_to_normal_indices_prefill(
-    sp_size, extend_seq_lens: np.ndarray
-):
+def sp_to_normal_indices_prefill(sp_size, extend_seq_lens: np.ndarray):
     """
     Indices from the Sequence Parallel layout (padded) to the normal layout.
     """
-    sp_seq_lens = np.ceil(extend_seq_lens / sp_size)
-    sp_seq_offset = np.concatenate([np.asarray([0], dtype=np.int32),
-                                    np.cumsum(sp_seq_lens[:-1])])
+    sp_seq_lens = np.ceil(extend_seq_lens / sp_size).astype(np.int32)
+    sp_len = np.sum(sp_seq_lens)
+    sp_seq_offset = np.concatenate(
+        [np.asarray([0], dtype=np.int32), np.cumsum(sp_seq_lens[:-1])]
+    )
     sp_arange = np.arange(sp_size).reshape(-1, 1)
-    for i in range(range(len(extend_seq_lens))):
-        sp_idx = np.arange(sp_seq_lens[i]).reshape(1,-1).repeat(sp_size, axis=0)
-        sp_idx = (sp_idx + sp_seq_offset[i] * sp_arange).reshpae(-1)
+    indices = []
+    for i in range(len(extend_seq_lens)):
+        sp_idx = np.arange(sp_seq_lens[i]).reshape(1, -1).repeat(sp_size, axis=0)
+        sp_idx = (sp_idx + sp_seq_offset[i] + sp_len * sp_arange).reshape(-1)
+        sp_idx = sp_idx[: extend_seq_lens[i]]
         indices.append(sp_idx)
     indices = np.concatenate(indices)
     return indices
@@ -1090,23 +1108,27 @@ def _debug_normal_to_sp_indices_decode(sp_size, seq_lens):
 def _debug_normal_to_sp_indices_prefill(sp_size, seq_lens):
     """(Debug only) Indices from normal layout to the SP layout (padded)."""
     indices = []
-    sp_seq_lens = np.ceil(seq_lens / sp_size)
-    seq_offset = np.concatenate([np.asarray([0], dtype=np.int32),
-                                 np.cumsum(seq_lens[:-1])])
-    sp_seq_offset = np.concatenate([np.asarray([0], dtype=np.int32),
-                                    np.cumsum(sp_seq_lens[:-1])])
+    sp_seq_lens = np.ceil(seq_lens / sp_size).astype(np.int32)
+    seq_offset = np.concatenate(
+        [np.asarray([0], dtype=np.int32), np.cumsum(seq_lens[:-1])]
+    )
+    sp_seq_offset = np.concatenate(
+        [np.asarray([0], dtype=np.int32), np.cumsum(sp_seq_lens[:-1])]
+    )
     for sp_rank in range(sp_size):
         start_idx = seq_offset + sp_seq_lens * sp_rank
-        end_idx = np.min(seq_offset + sp_seq_lens * (sp_rank + 1), seq_lens)
-        normal_layout_idx = (np.concatenate(
+        end_idx = np.minimum(seq_offset + sp_seq_lens * (sp_rank + 1), seq_lens)
+        normal_layout_idx = np.concatenate(
             [np.arange(start_idx[i], end_idx[i]) for i in range(len(seq_lens))]
-        ))
+        )
         if sp_rank == sp_size - 1:
             length = end_idx - start_idx
-            target_layout_idx = np.concatenate([
-                np.arange(sp_seq_offset[i], sp_seq_offset[i] + length[i])
-                for i in range(len(seq_lens))
-            ])
+            target_layout_idx = np.concatenate(
+                [
+                    np.arange(sp_seq_offset[i], sp_seq_offset[i] + length[i])
+                    for i in range(len(seq_lens))
+                ]
+            )
         else:
             target_layout_idx = np.arange(len(normal_layout_idx))
         indices.append((target_layout_idx, normal_layout_idx))
