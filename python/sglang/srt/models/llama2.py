@@ -27,7 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear, RowSeqParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.parallel_utils.parallel_state import (
     get_actual_tensor_model_parallel_world_size,
@@ -125,9 +125,12 @@ class LlamaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = RowSeqParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
+            self.total_num_heads,
+            self.num_kv_heads,
+            self.head_dim,
             bias=False,
             quant_config=quant_config,
         )
@@ -169,23 +172,27 @@ class LlamaAttention(nn.Module):
         # FIXME (yifan): hardcoded for now. Should fix q_proj to avoid all gather
         # and q.shape should be [sp_size, token_num_per_sp, num_heads_per_sp * head_dim]
         q = q.view(-1, self.hidden_size)
-        q = q[
-            :,
-            self.sp_rank
-            * self.sp_hidden_size : (self.sp_rank + 1)
-            * self.sp_hidden_size,
-        ]
+        if input_metadata.sp_size > 1:
+            qs, ks, vs = [], [], []
+            q_head_idxes = _get_sequence_parallel_head_idxes(
+                self.total_num_heads,
+                self.num_kv_heads,
+                self.sp_rank,
+                self.sp_size,
+            )
+            # FIXME(yonghao): remove once attn kernel is ready
+            for _, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
+                print(self.sp_rank, idxs, q_head_idxes)
+                qs.append(q[idxs].view(-1, self.total_num_heads, self.head_dim)[:, q_head_idxes])
+                ks.append(k[idxs])
+                vs.append(v[idxs])
+            q = qs
+            k = ks
+            v = vs
+
+        print("before attn", self.sp_rank, q.shape, k.shape, v.shape)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
-        if input_metadata.sp_size > 1:
-            # FIXME(yonghao): remove once attn kernel is ready
-            output_sp = torch.zeros_like(ori_hidden_states).reshape(
-                input_metadata.sp_size, -1, *ori_hidden_states.shape[1:]
-            )
-            for sp_rank, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
-                sp_real_vals = output[idxs]
-                output_sp[sp_rank][: sp_real_vals.shape[0]] = sp_real_vals
-            output = output_sp.reshape(ori_hidden_states.shape).contiguous()
         return output
 
 
@@ -385,3 +392,15 @@ class LlamaForCausalLM(nn.Module):
 
 
 EntryClass = LlamaForCausalLM
+
+
+def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):
+    group_size = total_num_heads // num_kv_heads
+    shard_num_heads = group_size // sp_size
+
+    idxes = [
+        group_size * i + sp_rank * shard_num_heads + j
+        for i in range(num_kv_heads)
+        for j in range(0, shard_num_heads)
+    ]
+    return idxes

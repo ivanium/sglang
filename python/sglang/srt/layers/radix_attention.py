@@ -177,8 +177,9 @@ class RadixAttention(nn.Module):
     ):
         raise NotImplementedError()
 
+    # TODO: fix qs, ks, vs here and should use tensors directly.
     def seq_parallel_extend_forward_flashinfer(
-        self, q, k, v, input_metadata: InputMetadata
+        self, qs, ks, vs, input_metadata: InputMetadata
     ):
         """Here we adopted a unique parallelization strategy.
         For each SP worker, we have
@@ -186,13 +187,6 @@ class RadixAttention(nn.Module):
             k tensor: [batch_size * seq_len // SP_SIZE, k_head_num, head_dim]
             v tensor: [batch_size * seq_len // SP_SIZE, v_head_num, head_dim]
         """
-
-        def get_sp_seq_range(token_num, sp_rank, sp_size):
-            sp_token_num = token_num // sp_size + ((token_num % sp_size) > sp_rank)
-            stt = sp_rank * (token_num // sp_size) + min(sp_rank, token_num % sp_size)
-            end = stt + sp_token_num
-            return stt, end
-
         def get_k_shard_shape(token_num, sp_rank, sp_size):
             sp_token_num = token_num // sp_size + ((token_num % sp_size) > sp_rank)
             return (sp_token_num, self.tp_k_head_num, self.head_dim)
@@ -215,14 +209,12 @@ class RadixAttention(nn.Module):
         num_iters = sp_size
         # FIXME (yifan): Below are hardcoded for debugging purpose. Should fix
         # this with the correct layout.
-        q = q.view(-1, self.tp_q_head_num, self.head_dim)
-        token_num = q.size(0)
+        token_num = input_metadata.total_num_tokens
         # FIXME (yifan): Because we haven't partitioned k and v along the sequence dimension
         # (dim 0 in k and v tensors), here we manually select the corresponding
         # shard for simulation.
-        orig_k, orig_v = k, v
-        k = k[rank, :, :]
-        v = v[rank, :, :]
+        k = ks[rank]
+        v = vs[rank]
 
         # FIXME: k and v should have been sharded and trimmed (padding tokens) so use them directly.
         local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
@@ -245,31 +237,21 @@ class RadixAttention(nn.Module):
                 # reserve space for kv tensors received from other peers
                 # FIXME (yifan): this is a dirty hack. Should use communication to get kv tensors as below.
                 owned_shards[from_rank] = (
-                    orig_k[from_rank, :, :]
-                    .contiguous()
-                    .view(-1, self.tp_k_head_num, self.head_dim),
-                    orig_v[from_rank, :, :]
-                    .contiguous()
-                    .view(-1, self.tp_k_head_num, self.head_dim),
+                    torch.empty(
+                        get_k_shard_shape(token_num, from_rank, sp_size),
+                        device=local_k.device,
+                        dtype=local_k.dtype,
+                    ),
+                    torch.empty(
+                        get_v_shard_shape(token_num, from_rank, sp_size),
+                        device=local_v.device,
+                        dtype=local_v.dtype,
+                    ),
                 )
-                # owned_shards[from_rank] = (
-                #     torch.empty(
-                #         get_k_shard_shape(token_num, from_rank, sp_size),
-                #         device=local_k.device,
-                #         dtype=local_k.dtype,
-                #     ),
-                #     torch.empty(
-                #         get_v_shard_shape(token_num, from_rank, sp_size),
-                #         device=local_v.device,
-                #         dtype=local_v.dtype,
-                #     ),
-                # )
-            # FIXME (yifan): somehow communication will hang. Re-enable this after fixing it.
-            # comm_reqs = self.launch_sp_comm_ops(
-            #     owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
-            # )
-            q_shard_stt, q_shard_end = get_sp_seq_range(token_num, sid, sp_size)
-            q_shard = q[q_shard_stt:q_shard_end, :, :]
+            comm_reqs = self.launch_sp_comm_ops(
+                owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
+            )
+            q_shard = qs[sid]
             k_shard, v_shard = owned_shards[sid]
             # Ragged attention computation for self attention within the shard
             o, s = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
@@ -291,8 +273,7 @@ class RadixAttention(nn.Module):
                 i, j = (
                     (existing_sid, sid) if existing_sid > sid else (sid, existing_sid)
                 )
-                q_shard_stt, q_shard_end = get_sp_seq_range(token_num, i, sp_size)
-                q_data = q[q_shard_stt:q_shard_end]
+                q_data = qs[i]
                 # FIXME (yifan): should store them into kv cache and use kv cache here.
                 kv_data = torch.stack(owned_shards[j], dim=1)
                 o, s = (
@@ -307,8 +288,7 @@ class RadixAttention(nn.Module):
                 append_merge_shard(output_shards[i], o, s)
 
             # Wait for async communication to complete
-            # FIXME (yifan): re-enable communication after fixing the bug.
-            # self.wait_sp_comm_ops(comm_reqs)
+            self.wait_sp_comm_ops(comm_reqs)
             if rank != from_rank:
                 owned_sids.append(from_rank)
             sid = from_rank
@@ -337,8 +317,12 @@ class RadixAttention(nn.Module):
         raise NotImplementedError()
 
     def forward(self, q, k, v, input_metadata: InputMetadata):
-        k = k.view(-1, self.tp_k_head_num, self.head_dim)
-        v = v.view(-1, self.tp_v_head_num, self.head_dim)
+        if input_metadata.sp_size > 1:
+            k = [t.view(-1, self.tp_k_head_num, self.head_dim) for t in k]
+            v = [t.view(-1, self.tp_v_head_num, self.head_dim) for t in v]
+        else:
+            k = k.view(-1, self.tp_k_head_num, self.head_dim)
+            v = v.view(-1, self.tp_v_head_num, self.head_dim)
 
         if input_metadata.forward_mode == ForwardMode.EXTEND:
             return self.extend_forward(q, k, v, input_metadata)

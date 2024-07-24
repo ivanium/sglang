@@ -10,6 +10,8 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from sglang.srt.layers.parallel_utils.parallel_state import (
     get_actual_tensor_model_parallel_rank,
     get_actual_tensor_model_parallel_world_size,
+    get_sequence_parallel_local_rank,
+    get_sequence_parallel_world_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -301,3 +303,84 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
                 )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+
+
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L660
+class RowSeqParallelLinear(RowParallelLinear):
+    """ TODO: add doc string.
+    """
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        total_num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        bias: bool = True,
+        input_is_parallel: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = True,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        super().__init__(
+            input_size,
+            output_size,
+            bias,
+            input_is_parallel,
+            skip_bias_add,
+            params_dtype,
+            reduce_results,
+            quant_config,
+        )
+        self.total_num_heads = total_num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        actual_tp_rank = get_actual_tensor_model_parallel_rank()
+        actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        sp_size = get_sequence_parallel_world_size()
+        sp_rank = get_sequence_parallel_local_rank()
+
+        input_dim = getattr(param, "input_dim", None)
+        param_data = param.data
+        if input_dim is not None:
+            # Load TP weight shard
+            shard_size = param_data.shape[input_dim]
+            tp_shard_size = shard_size * sp_size
+            start_idx = actual_tp_rank * tp_shard_size
+            loaded_weight = loaded_weight.narrow(input_dim, start_idx, tp_shard_size)
+            # Load SP weight shard
+            tp_num_heads = self.total_num_heads // actual_tp_size
+            idxes = _get_sequence_parallel_head_idxes(
+                tp_num_heads, self.num_kv_heads, sp_rank, sp_size
+            )
+            loaded_weight = (
+                loaded_weight.contiguous()
+                .view(loaded_weight.shape[0], tp_num_heads, self.head_dim)[:, idxes]
+                .view(loaded_weight.shape[0], shard_size)
+            )
+
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            if sp_size > 1:
+                raise NotImplementedError("Loading scales off disk is not supported.")
+            loaded_weight = loaded_weight.reshape(1)
+
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+
+def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):
+    group_size = total_num_heads // num_kv_heads
+    shard_num_heads = group_size // sp_size
+
+    idxes = [
+        group_size * i + sp_rank * shard_num_heads + j
+        for i in range(num_kv_heads)
+        for j in range(0, shard_num_heads)
+    ]
+    return idxes
