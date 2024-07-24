@@ -955,13 +955,19 @@ def init_flashinfer_args(
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
 
-    # FIXME (yifan): these are hardcoded values for debugging. Fix them use the real layout.
-    seq_lens = seq_lens // model_runner.sp_size
-    prefix_lens = prefix_lens // model_runner.sp_size
-
     if forward_mode == ForwardMode.DECODE:
         paged_kernel_lens = seq_lens
     else:
+        # FIXME (yifan): Simplify the layout adjust code below.
+        seq_lens_cpu = seq_lens.cpu().numpy()
+        prefix_lens_cpu = prefix_lens.cpu().numpy()
+        for i in range(batch_size):
+            seq_len = seq_lens_cpu[i]
+            prefix_len = prefix_lens_cpu[i]
+            seq_lens_cpu[i] = seq_len // model_runner.sp_size + (seq_len % model_runner.sp_size > model_runner.sp_rank)
+            prefix_lens_cpu[i] = prefix_len // model_runner.sp_size + (prefix_len % model_runner.sp_size > model_runner.sp_rank)
+        seq_lens = torch.tensor(seq_lens_cpu, dtype=torch.int32, device="cuda")
+        prefix_lens = torch.tensor(prefix_lens_cpu, dtype=torch.int32, device="cuda")
         paged_kernel_lens = prefix_lens
 
     kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
@@ -982,10 +988,12 @@ def init_flashinfer_args(
             dim=0,
         ).contiguous()
     else:
+        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+        kv_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
         kv_indices = torch.arange(
             0, torch.sum(seq_lens), dtype=torch.int32, device="cuda"
         )
-        kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
+    kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
     if forward_mode == ForwardMode.DECODE:
         flashinfer_decode_wrapper.end_forward()
