@@ -308,8 +308,8 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L660
 class RowSeqParallelLinear(RowParallelLinear):
-    """ TODO: add doc string.
-    """
+    """TODO: add doc string."""
+
     def __init__(
         self,
         input_size: int,

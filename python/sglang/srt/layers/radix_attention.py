@@ -117,10 +117,10 @@ class RadixAttention(nn.Module):
 
             o, _ = merge_state(o1, s1, o2, s2)
 
-        self.store_kv_cache(k, v, input_metadata)
+        # self.store_kv_cache(k, v, input_metadata)
 
-        if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
-            torch.cuda.synchronize()
+        # if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+        #     torch.cuda.synchronize()
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
@@ -187,6 +187,7 @@ class RadixAttention(nn.Module):
             k tensor: [batch_size * seq_len // SP_SIZE, k_head_num, head_dim]
             v tensor: [batch_size * seq_len // SP_SIZE, v_head_num, head_dim]
         """
+
         def get_k_shard_shape(token_num, sp_rank, sp_size):
             sp_token_num = token_num // sp_size + ((token_num % sp_size) > sp_rank)
             return (sp_token_num, self.tp_k_head_num, self.head_dim)

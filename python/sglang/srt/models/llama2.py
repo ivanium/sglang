@@ -183,14 +183,17 @@ class LlamaAttention(nn.Module):
             # FIXME(yonghao): remove once attn kernel is ready
             for _, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
                 print(self.sp_rank, idxs, q_head_idxes)
-                qs.append(q[idxs].view(-1, self.total_num_heads, self.head_dim)[:, q_head_idxes])
+                qs.append(
+                    q[idxs].view(-1, self.total_num_heads, self.head_dim)[
+                        :, q_head_idxes
+                    ]
+                )
                 ks.append(k[idxs])
                 vs.append(v[idxs])
             q = qs
             k = ks
             v = vs
 
-        print("before attn", self.sp_rank, q.shape, k.shape, v.shape)
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output

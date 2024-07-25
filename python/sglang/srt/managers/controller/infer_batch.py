@@ -964,8 +964,12 @@ def init_flashinfer_args(
         for i in range(batch_size):
             seq_len = seq_lens_cpu[i]
             prefix_len = prefix_lens_cpu[i]
-            seq_lens_cpu[i] = seq_len // model_runner.sp_size + (seq_len % model_runner.sp_size > model_runner.sp_rank)
-            prefix_lens_cpu[i] = prefix_len // model_runner.sp_size + (prefix_len % model_runner.sp_size > model_runner.sp_rank)
+            seq_lens_cpu[i] = seq_len // model_runner.sp_size + (
+                seq_len % model_runner.sp_size > model_runner.sp_rank
+            )
+            prefix_lens_cpu[i] = prefix_len // model_runner.sp_size + (
+                prefix_len % model_runner.sp_size > model_runner.sp_rank
+            )
         seq_lens = torch.tensor(seq_lens_cpu, dtype=torch.int32, device="cuda")
         prefix_lens = torch.tensor(prefix_lens_cpu, dtype=torch.int32, device="cuda")
         paged_kernel_lens = prefix_lens
