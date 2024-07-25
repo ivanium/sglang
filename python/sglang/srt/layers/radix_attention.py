@@ -117,10 +117,10 @@ class RadixAttention(nn.Module):
 
             o, _ = merge_state(o1, s1, o2, s2)
 
-        # self.store_kv_cache(k, v, input_metadata)
+        self.store_kv_cache(k, v, input_metadata)
 
-        # if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
-        #     torch.cuda.synchronize()
+        if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+            torch.cuda.synchronize()
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
