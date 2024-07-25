@@ -159,14 +159,16 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        if input_metadata.sp_size > 1:
-            # FIXME(yonghao): remove once attn kernel is ready
-            hidden_states = hidden_states[
-                input_metadata.sp_to_normal_indices
-            ].contiguous()
         q, k, v = self.qkv_proj(hidden_states)
+
         # FIXME (yifan): q and k have different shape here so we need to adapt
         # the positional embedding part.. Currently this is a quite dirty hack.
+        if input_metadata.sp_size > 1:
+            # FIXME(yonghao): remove once attn kernel is ready
+            idxs = input_metadata.sp_to_normal_indices
+            q = q[idxs].contiguous()
+            k = k[idxs].contiguous()
+            v = v[idxs].contiguous()
         q, _ = self.rotary_emb(positions, q, q)
         _, k = self.rotary_emb(positions, k, k)
         # q, k = self.rotary_emb(positions, q, k)
