@@ -179,7 +179,7 @@ class RadixAttention(nn.Module):
 
     # TODO: fix qs, ks, vs here and should use tensors directly.
     def seq_parallel_extend_forward_flashinfer(
-        self, qs, ks, vs, input_metadata: InputMetadata
+        self, qs, k, v, input_metadata: InputMetadata
     ):
         """Here we adopted a unique parallelization strategy.
         For each SP worker, we have
@@ -208,15 +208,7 @@ class RadixAttention(nn.Module):
         sp_size = get_sequence_parallel_world_size()
         num_shards = sp_size
         num_iters = sp_size
-        # FIXME (yifan): Below are hardcoded for debugging purpose. Should fix
-        # this with the correct layout.
         token_num = input_metadata.total_num_tokens
-        # FIXME (yifan): Because we haven't partitioned k and v along the sequence dimension
-        # (dim 0 in k and v tensors), here we manually select the corresponding
-        # shard for simulation.
-        k = ks[rank]
-        v = vs[rank]
-
         # FIXME: k and v should have been sharded and trimmed (padding tokens) so use them directly.
         local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
         local_v = v.contiguous().view(-1, self.tp_v_head_num, self.head_dim)
@@ -318,12 +310,8 @@ class RadixAttention(nn.Module):
         raise NotImplementedError()
 
     def forward(self, q, k, v, input_metadata: InputMetadata):
-        if input_metadata.sp_size > 1:
-            k = [t.view(-1, self.tp_k_head_num, self.head_dim) for t in k]
-            v = [t.view(-1, self.tp_v_head_num, self.head_dim) for t in v]
-        else:
-            k = k.view(-1, self.tp_k_head_num, self.head_dim)
-            v = v.view(-1, self.tp_v_head_num, self.head_dim)
+        k = k.view(-1, self.tp_k_head_num, self.head_dim)
+        v = v.view(-1, self.tp_v_head_num, self.head_dim)
 
         if input_metadata.forward_mode == ForwardMode.EXTEND:
             return self.extend_forward(q, k, v, input_metadata)

@@ -105,6 +105,7 @@ class QKVParallelLinear(torch.nn.Module):
             params_dtype,
             quant_config,
         )
+        self.hidden_size = hidden_size
         self.kv_size = self.kv_proj.num_kv_heads * self.kv_proj.head_size
 
     def forward(
@@ -112,6 +113,12 @@ class QKVParallelLinear(torch.nn.Module):
         hidden_states: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q, _ = self.q_proj(hidden_states)
+        actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        tp_rank = get_actual_tensor_model_parallel_rank()
+        if actual_tp_size > 1:
+            tp_hidden_size = divide(self.hidden_size, actual_tp_size)
+            q = q.narrow(1, tp_rank * tp_hidden_size, tp_hidden_size).contiguous()
+
         kv, _ = self.kv_proj(hidden_states)
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
         return q, k, v
@@ -203,7 +210,8 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
 
         if loaded_shard_id is None:
             # Loaded weight is already fused on disk (qkv/mlp).
-            raise NotImplementedError("Fused weight loading is not supported.")
+            if get_sequence_parallel_world_size() > 1:
+                raise NotImplementedError("Fused weight loading is not supported.")
             if output_dim is None:
                 assert param_data.shape == loaded_weight.shape
                 param_data.copy_(loaded_weight)

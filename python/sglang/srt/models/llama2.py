@@ -92,9 +92,11 @@ class LlamaAttention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         # This is the actual TP size
         actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        # Sequence parallel size
+        sp_size = get_sequence_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        self.num_heads = self.total_num_heads // actual_tp_size
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= actual_tp_size:
             # Number of KV heads is greater than actual TP size, so we partition
@@ -144,7 +146,7 @@ class LlamaAttention(nn.Module):
             is_neox_style=rope_is_neox_style,
         )
         self.attn = RadixAttention(
-            self.num_heads,
+            self.num_heads // sp_size,  # SP will partition the heads of Q
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
@@ -159,7 +161,6 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         if input_metadata.sp_size > 1:
             # FIXME(yonghao): remove once attn kernel is ready
-            ori_hidden_states = hidden_states
             hidden_states = hidden_states[
                 input_metadata.sp_to_normal_indices
             ].contiguous()
@@ -169,30 +170,25 @@ class LlamaAttention(nn.Module):
         q, _ = self.rotary_emb(positions, q, q)
         _, k = self.rotary_emb(positions, k, k)
         # q, k = self.rotary_emb(positions, q, k)
-        # FIXME (yifan): hardcoded for now. Should fix q_proj to avoid all gather
-        # and q.shape should be [sp_size, token_num_per_sp, num_heads_per_sp * head_dim]
-        q = q.view(-1, self.hidden_size)
         if input_metadata.sp_size > 1:
-            qs, ks, vs = [], [], []
             q_head_idxes = _get_sequence_parallel_head_idxes(
-                self.total_num_heads,
+                self.num_heads,
                 self.num_kv_heads,
                 self.sp_rank,
                 self.sp_size,
             )
             # FIXME(yonghao): remove once attn kernel is ready
+            qs = []
             for _, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
-                print(self.sp_rank, idxs, q_head_idxes)
                 qs.append(
-                    q[idxs].view(-1, self.total_num_heads, self.head_dim)[
+                    q.view(-1, self.num_heads, self.head_dim)[idxs][
                         :, q_head_idxes
-                    ]
+                    ].contiguous()
                 )
-                ks.append(k[idxs])
-                vs.append(v[idxs])
             q = qs
-            k = ks
-            v = vs
+            idxs = input_metadata._debug_normal_to_sp_metadata[self.sp_rank]
+            k = k[idxs]
+            v = v[idxs]
 
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
