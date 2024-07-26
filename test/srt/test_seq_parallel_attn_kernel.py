@@ -8,37 +8,37 @@ from sglang.srt.layers.parallel_utils.parallel_state import initialize_model_par
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 
-NUM_HEADS = 8
+NUM_HEADS = 32
 HEAD_DIM = 128
 SCALING = 1
-NUM_KV_HEADS = 1
+NUM_KV_HEADS = 8
 LAYER_ID = 0
 LOGIT_CAP = -1
 
 
-BATCH_SIZE = 12
-QO_LEN = 1024
-KV_LEN = 1024
+BATCH_SIZE = 1
+QO_LEN = 128
+KV_LEN = 128
 
 
 def gen_qkv(rank: int = 0, sp_size: int = 1):
     torch.manual_seed(42)
     random.seed(42)
-    q = torch.randn(BATCH_SIZE, QO_LEN, NUM_HEADS, HEAD_DIM).cuda().half()
-    k = torch.randn(BATCH_SIZE, KV_LEN, NUM_KV_HEADS, HEAD_DIM).cuda().half()
-    v = torch.randn(BATCH_SIZE, KV_LEN, NUM_KV_HEADS, HEAD_DIM).cuda().half()
+    q = torch.randn(BATCH_SIZE * QO_LEN, NUM_HEADS, HEAD_DIM).cuda().half()
+    k = torch.randn(BATCH_SIZE * KV_LEN, NUM_KV_HEADS, HEAD_DIM).cuda().half()
+    v = torch.randn(BATCH_SIZE * KV_LEN, NUM_KV_HEADS, HEAD_DIM).cuda().half()
 
-    num_heads_per_partition = NUM_HEADS // sp_size
-    q = q[
-        :, :, num_heads_per_partition * rank : num_heads_per_partition * (rank + 1)
-    ].contiguous()
-    kv_len_per_partition = KV_LEN // sp_size
-    k = k[
-        :, kv_len_per_partition * rank : kv_len_per_partition * (rank + 1)
-    ].contiguous()
-    v = v[
-        :, kv_len_per_partition * rank : kv_len_per_partition * (rank + 1)
-    ].contiguous()
+    # num_heads_per_partition = NUM_HEADS // sp_size
+    # q = q[
+    #     :, :, num_heads_per_partition * rank : num_heads_per_partition * (rank + 1)
+    # ].contiguous()
+    # kv_len_per_partition = KV_LEN // sp_size
+    # k = k[
+    #     :, kv_len_per_partition * rank : kv_len_per_partition * (rank + 1)
+    # ].contiguous()
+    # v = v[
+    #     :, kv_len_per_partition * rank : kv_len_per_partition * (rank + 1)
+    # ].contiguous()
 
     return q, k, v
 
@@ -52,7 +52,7 @@ def get_input_metadata(sp_size: int = 1, tp_size: int = 1):
     input_metadata = InputMetadata(
         forward_mode=None,
         batch_size=BATCH_SIZE,
-        total_num_tokens=None,
+        total_num_tokens=BATCH_SIZE * QO_LEN,
         req_pool_indices=None,
         seq_lens=None,
         positions=None,
@@ -67,6 +67,7 @@ def get_input_metadata(sp_size: int = 1, tp_size: int = 1):
         flashinfer_prefill_wrapper_ragged=None,
         flashinfer_prefill_wrapper_paged=None,
         flashinfer_decode_wrapper=None,
+        sp_size=sp_size,
     )
 
     workspace_buffer = torch.empty(
@@ -151,22 +152,43 @@ def sp_worker(rank: int = 0, sp_size: int = 1, tp_size: int = 1):
     # Computation
     input_metadata = get_input_metadata(sp_size=sp_size, tp_size=tp_size)
     q, k, v = gen_qkv(rank, sp_size)
-    _, k_other, v_other = gen_qkv((rank + 1) % sp_size, sp_size)
+    qs, ks, vs = [], [], []
+    q_head_idxes = _get_sequence_parallel_head_idxes(
+        NUM_HEADS, NUM_KV_HEADS, rank, sp_size
+    )
+    print(rank, q_head_idxes)
+    for i in range(sp_size):
+        qs.append(
+            q[(QO_LEN // sp_size) * i : (QO_LEN // sp_size) * (i + 1), q_head_idxes]
+        )
+        ks.append(k[(KV_LEN // sp_size) * i : (KV_LEN // sp_size) * (i + 1)])
+        vs.append(v[(KV_LEN // sp_size) * i : (KV_LEN // sp_size) * (i + 1)])
 
-    output = attn.seq_parallel_extend_forward_flashinfer(q, k, v, input_metadata)
+    output = attn.seq_parallel_extend_forward_flashinfer(qs, ks, vs, input_metadata)
 
     o_truth = reference_attn()
     o_truth = (
         o_truth.contiguous()
-        .reshape(-1, NUM_HEADS, HEAD_DIM)[
-            :, rank * NUM_HEADS // sp_size : (rank + 1) * NUM_HEADS // sp_size
-        ]
+        .view(-1, NUM_HEADS, HEAD_DIM)[:, q_head_idxes]
         .view(-1, NUM_HEADS // sp_size * HEAD_DIM)
     )
+
     print("SP worker", rank, "results:")
     print("Mean: ", torch.mean(torch.abs(output - o_truth)))
     print("Max: ", torch.max(torch.abs(output - o_truth)))
     assert torch.allclose(output, o_truth, rtol=1e-2, atol=1e-3)
+
+
+def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):
+    group_num = num_kv_heads
+    group_size = total_num_heads // num_kv_heads
+    shard_num_heads = group_size // sp_size
+    idxes = [
+        group_size * i + sp_rank * shard_num_heads + j
+        for i in range(group_num)
+        for j in range(0, shard_num_heads)
+    ]
+    return idxes
 
 
 def reference_attn():
