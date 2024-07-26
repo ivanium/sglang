@@ -98,8 +98,8 @@ def load_model(server_args, tp_rank, sp_rank: int = 0):
 def prepare_inputs(bench_args, tokenizer):
     prompts = [
         "The capital of France is",
-        "The capital of the United Kindom is",
-        "Today is a sunny day and I like",
+        "The capital of the United Kindom",
+        "Today is a sunny day and I like to",
     ]
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
@@ -199,16 +199,16 @@ def correctness_test(
     rank_print("prefill logits (final)", next_token_logits)
 
     # FIXME (yifan): enable decode later.
-    # # # Decode
-    # # output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    # # for _ in range(bench_args.output_len):
-    # #     next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-    # #     for i in range(len(reqs)):
-    # #         output_ids[i].append(next_token_ids[i])
+    # Decode
+    output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
+    # for _ in range(bench_args.output_len):
+    #     next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+    #     for i in range(len(reqs)):
+    #         output_ids[i].append(next_token_ids[i])
 
-    # # Print
-    # for i in range(len(reqs)):
-    #     rank_print(tokenizer.decode(output_ids[i]))
+    # Print
+    for i in range(len(reqs)):
+        rank_print(tokenizer.decode(output_ids[i]))
 
 
 def latency_test(
