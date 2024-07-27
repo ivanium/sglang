@@ -148,8 +148,10 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
         )
+        # Attention uses both TP and SP -- (actual TP size, SP size)
+        actual_tp_size = self.tp_size // self.sp_size
         head_dim = self.model_config.head_dim
-        head_num = self.model_config.get_num_kv_heads(self.tp_size)
+        head_num = self.model_config.get_num_kv_heads(actual_tp_size)
         cell_size = (
             head_num
             * head_dim
@@ -164,6 +166,12 @@ class ModelRunner:
         return max_num_token
 
     def init_memory_pool(self, total_gpu_memory):
+        if self.tp_size % self.sp_size != 0:
+            raise ValueError(
+                f"Invalid sequence parallel configuration. tp_size={self.tp_size} "
+                f"must be divisible by sp_size={self.sp_size}"
+            )
+
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if self.max_total_num_tokens <= 0:
@@ -178,11 +186,7 @@ class ModelRunner:
             ),
             self.model_config.context_len + 8,
         )
-        if self.tp_size % self.sp_size != 0:
-            raise ValueError(
-                f"Invalid sequence parallel configuration. tp_size={self.tp_size} "
-                f"must be divisible by sp_size={self.sp_size}"
-            )
+
         # Attention uses both TP and SP -- (actual TP size, SP size)
         actual_tp_size = self.tp_size // self.sp_size
         self.token_to_kv_pool = TokenToKVPool(
