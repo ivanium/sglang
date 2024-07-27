@@ -178,10 +178,17 @@ class ModelRunner:
             ),
             self.model_config.context_len + 8,
         )
+        if self.tp_size % self.sp_size != 0:
+            raise ValueError(
+                f"Invalid sequence parallel configuration. tp_size={self.tp_size} "
+                f"must be divisible by sp_size={self.sp_size}"
+            )
+        # Attention uses both TP and SP -- (actual TP size, SP size)
+        actual_tp_size = self.tp_size // self.sp_size
         self.token_to_kv_pool = TokenToKVPool(
             self.max_total_num_tokens,
             dtype=self.dtype,
-            head_num=self.model_config.get_num_kv_heads(self.tp_size),
+            head_num=self.model_config.get_num_kv_heads(actual_tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
         )

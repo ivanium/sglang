@@ -228,7 +228,6 @@ class RadixAttention(nn.Module):
             # Launch async communication operations
             if rank != from_rank:
                 # reserve space for kv tensors received from other peers
-                # FIXME (yifan): this is a dirty hack. Should use communication to get kv tensors as below.
                 owned_shards[from_rank] = (
                     torch.empty(
                         get_k_shard_shape(token_num, from_rank, sp_size),
@@ -267,7 +266,6 @@ class RadixAttention(nn.Module):
                     (existing_sid, sid) if existing_sid > sid else (sid, existing_sid)
                 )
                 q_data = qs[i]
-                # FIXME (yifan): should store them into kv cache and use kv cache here.
                 kv_data = torch.stack(owned_shards[j], dim=1)
                 o, s = (
                     input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
@@ -295,11 +293,10 @@ class RadixAttention(nn.Module):
         ]
         o = torch.cat(os, dim=0)
 
-        # FIXME (yifan): enable kv cache storage after we supoprt it.
-        # self.store_kv_cache(k, v, input_metadata)
+        self.store_kv_cache(local_k, local_v, input_metadata)
 
-        # if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
-        #     torch.cuda.synchronize()
+        if input_metadata.total_num_tokens >= global_config.layer_sync_threshold:
+            torch.cuda.synchronize()
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
