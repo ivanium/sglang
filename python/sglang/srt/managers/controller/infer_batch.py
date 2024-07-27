@@ -385,11 +385,10 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         if self.sp_size > 1:
             extend_seq_lens = seq_lens - prefix_lens
-            # FIXME(yonghao): _extend_num_tokens -> extend_num_tokens once kv cache store is ready for SP
             extend_local_token_nums = _get_local_token_nums(
                 self.sp_rank, self.sp_size, extend_seq_lens
             )
-            _extend_num_tokens = int(np.sum(extend_local_token_nums))
+            extend_num_tokens = int(np.sum(extend_local_token_nums))
 
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
@@ -405,8 +404,7 @@ class Batch:
         for i in range(bs):
             extend_len = extend_lens[i]
             if self.sp_size > 1:
-                # FIXME(yonghao): _extend_len > extend_len once SP Attn is ready
-                _extend_len = extend_local_token_nums[i]
+                extend_len = extend_local_token_nums[i]
             self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][
                 prefix_lens[i] : prefix_lens[i] + extend_len
             ] = out_cache_loc[pt : pt + extend_len]
