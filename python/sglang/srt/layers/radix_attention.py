@@ -209,7 +209,7 @@ class RadixAttention(nn.Module):
         num_shards = sp_size
         num_iters = sp_size
         token_num = input_metadata.total_num_tokens
-        # FIXME: k and v should have been sharded and trimmed (padding tokens) so use them directly.
+        # k and v should have been sharded and trimmed (padding tokens) here so use them directly.
         local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
         local_v = v.contiguous().view(-1, self.tp_v_head_num, self.head_dim)
 
@@ -283,9 +283,8 @@ class RadixAttention(nn.Module):
             if rank != from_rank:
                 owned_sids.append(from_rank)
             sid = from_rank
-        # TODO(yifan): double check this
-        # Reshape all o tensors so that we can concatenate along the sequence dimension
-        # we must have len(shard_list) == 1 here
+
+        # Concat all output shards along the sequence dimension.
         os = [
             o.view(-1, self.tp_q_head_num, self.head_dim)
             for shard_list in output_shards
