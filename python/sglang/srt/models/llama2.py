@@ -31,8 +31,6 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowSeqParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.parallel_utils.parallel_state import (
     get_actual_tensor_model_parallel_world_size,
-    get_sequence_parallel_local_rank,
-    get_sequence_parallel_world_size,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
@@ -115,11 +113,6 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        # FIXME (yifan): only used for reshaping q tensor. Remove them once we fix q_proj
-        self.sp_rank = get_sequence_parallel_local_rank()
-        self.sp_size = get_sequence_parallel_world_size()
-        self.sp_hidden_size = hidden_size // self.sp_size
-
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -179,7 +172,8 @@ class LlamaAttention(nn.Module):
             for _, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
                 qs.append(q.contiguous().view(-1, self.num_heads, self.head_dim)[idxs])
             q = qs
-            idxs = input_metadata._debug_normal_to_sp_metadata[self.sp_rank]
+            sp_rank = input_metadata.sp_rank
+            idxs = input_metadata._debug_normal_to_sp_metadata[sp_rank]
             k = k[idxs]
             v = v[idxs]
 
