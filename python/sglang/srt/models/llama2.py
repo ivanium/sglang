@@ -93,11 +93,14 @@ class LlamaAttention(nn.Module):
         # This is the actual TP size
         actual_tp_size = get_actual_tensor_model_parallel_world_size()
         # Sequence parallel size
-        sp_size = get_sequence_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // actual_tp_size
+        # num_heads is partitioned by both TP and SP so here use tp_size which
+        # represents the total TP x SP parallelism.
+        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
+        # num_kv_heads is partitioned only by TP so here use actual_tp_size which
+        # represents the actual TP parallelism.
         if self.total_num_kv_heads >= actual_tp_size:
             # Number of KV heads is greater than actual TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -108,8 +111,6 @@ class LlamaAttention(nn.Module):
             assert actual_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // actual_tp_size)
         self.head_dim = hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -146,7 +147,7 @@ class LlamaAttention(nn.Module):
             is_neox_style=rope_is_neox_style,
         )
         self.attn = RadixAttention(
-            self.num_heads // sp_size,  # SP will partition the heads of Q
+            self.num_heads,  # SP will partition the heads of Q
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
@@ -173,20 +174,10 @@ class LlamaAttention(nn.Module):
         _, k = self.rotary_emb(positions, k, k)
         # q, k = self.rotary_emb(positions, q, k)
         if input_metadata.sp_size > 1:
-            q_head_idxes = _get_sequence_parallel_head_idxes(
-                self.num_heads,
-                self.num_kv_heads,
-                self.sp_rank,
-                self.sp_size,
-            )
             # FIXME(yonghao): remove once attn kernel is ready
             qs = []
             for _, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
-                qs.append(
-                    q.view(-1, self.num_heads, self.head_dim)[idxs][
-                        :, q_head_idxes
-                    ].contiguous()
-                )
+                qs.append(q.contiguous().view(-1, self.num_heads, self.head_dim)[idxs])
             q = qs
             idxs = input_metadata._debug_normal_to_sp_metadata[self.sp_rank]
             k = k[idxs]

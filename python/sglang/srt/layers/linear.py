@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -86,9 +86,11 @@ class QKVParallelLinear(torch.nn.Module):
         # We probably need to manually partition the q_proj in this case since RowPrallelLinear
         # will perform all-gather after the computation.
         # q projection can be naively tensor parallelized
-        self.q_proj = RowParallelLinear(
+        self.q_proj = ColumnSeqParallelLinear(
             hidden_size,
-            head_size * total_num_heads,
+            head_size,
+            total_num_heads,
+            total_num_kv_heads,
             bias,
             skip_bias_add,
             params_dtype,
@@ -113,15 +115,106 @@ class QKVParallelLinear(torch.nn.Module):
         hidden_states: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q, _ = self.q_proj(hidden_states)
-        actual_tp_size = get_actual_tensor_model_parallel_world_size()
-        tp_rank = get_actual_tensor_model_parallel_rank()
-        if actual_tp_size > 1:
-            tp_hidden_size = divide(self.hidden_size, actual_tp_size)
-            q = q.narrow(1, tp_rank * tp_hidden_size, tp_hidden_size).contiguous()
-
         kv, _ = self.kv_proj(hidden_states)
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
         return q, k, v
+
+
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L191
+class ColumnSeqParallelLinear(ColumnParallelLinear):
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: Optional[int] = None,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        if total_num_kv_heads is None:
+            total_num_kv_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        # Divide the weight matrix along the last dimension.
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = total_num_heads
+        self.num_heads = divide(total_num_heads, tp_size)
+        # num_kv_heads is used for tracking the number of groups in GQA.
+        actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        if actual_tp_size >= self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(actual_tp_size, self.total_num_kv_heads)
+        else:
+            self.num_kv_heads = divide(self.total_num_kv_heads, actual_tp_size)
+            self.num_kv_head_replicas = 1
+
+        input_size = self.hidden_size
+        # NOTE: here we use total_num_heads to make the parent class happy because
+        # it expects pure tensor parallelism along the num_heads dimension. output_size
+        # here is the total size of all TP and SP workers.
+        output_size = self.total_num_heads * self.head_size
+
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            gather_output=False,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        actual_tp_rank = get_actual_tensor_model_parallel_rank()
+        actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        sp_size = get_sequence_parallel_world_size()
+        sp_rank = get_sequence_parallel_local_rank()
+
+        output_dim = getattr(param, "output_dim", None)
+        param_data = param.data
+        if output_dim is not None:
+            shard_size = param_data.shape[output_dim]
+            # Load TP weight shard
+            tp_shard_size = shard_size * sp_size
+            start_idx = actual_tp_rank * tp_shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, tp_shard_size)
+            # Load SP weight shard
+            tp_num_heads = self.total_num_heads // actual_tp_size
+            idxes = torch.tensor(
+                _get_sequence_parallel_head_idxes(
+                    tp_num_heads, self.num_kv_heads, sp_rank, sp_size
+                ),
+                dtype=torch.int32,
+            )
+            weight_shape = loaded_weight.shape
+            tp_shard_shape = _reshape_dimension(
+                weight_shape, output_dim, [tp_num_heads, self.head_size]
+            )
+            sp_shard_shape = _reshape_dimension(weight_shape, output_dim, [shard_size])
+            loaded_weight = (
+                loaded_weight.reshape(tp_shard_shape)
+                .index_select(output_dim, idxes)
+                .contiguous()
+                .view(sp_shard_shape)
+            )
+
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            if sp_size > 1:
+                raise NotImplementedError("Loading scales off disk is not supported.")
+            loaded_weight = loaded_weight.reshape(1)
+
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
 
 
 # Adapted from
@@ -175,8 +268,8 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
             self.num_kv_heads = divide(self.total_num_kv_heads, actual_tp_size)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
-        # NOTE (yifan): here we use tp_size to make parent class happy. This is
-        # because parent class expects pure tensor parallelism.
+        # NOTE: here we use tp_size to make the parent class happy because it
+        # expects pure tensor parallelism along the num_heads dimension.
         tp_size = get_tensor_model_parallel_world_size()
         output_size = 2 * self.num_kv_heads * tp_size * self.head_size
         self.output_sizes = [
@@ -355,20 +448,28 @@ class RowSeqParallelLinear(RowParallelLinear):
         input_dim = getattr(param, "input_dim", None)
         param_data = param.data
         if input_dim is not None:
-            # Load TP weight shard
             shard_size = param_data.shape[input_dim]
+            # Load TP weight shard
             tp_shard_size = shard_size * sp_size
             start_idx = actual_tp_rank * tp_shard_size
             loaded_weight = loaded_weight.narrow(input_dim, start_idx, tp_shard_size)
             # Load SP weight shard
             tp_num_heads = self.total_num_heads // actual_tp_size
-            idxes = _get_sequence_parallel_head_idxes(
-                tp_num_heads, self.num_kv_heads, sp_rank, sp_size
+            idxes = torch.tensor(
+                _get_sequence_parallel_head_idxes(
+                    tp_num_heads, self.num_kv_heads, sp_rank, sp_size
+                )
             )
+            weight_shape = loaded_weight.shape
+            tp_shard_shape = _reshape_dimension(
+                weight_shape, input_dim, [tp_num_heads, self.head_dim]
+            )
+            sp_shard_shape = _reshape_dimension(weight_shape, input_dim, [shard_size])
             loaded_weight = (
-                loaded_weight.contiguous()
-                .view(loaded_weight.shape[0], tp_num_heads, self.head_dim)[:, idxes]
-                .view(loaded_weight.shape[0], shard_size)
+                loaded_weight.reshape(tp_shard_shape)
+                .index_select(input_dim, idxes)
+                .contiguous()
+                .view(sp_shard_shape)
             )
 
         # Special case for loading scales off disk, which often do not
@@ -392,3 +493,17 @@ def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp
         for j in range(0, shard_num_heads)
     ]
     return idxes
+
+
+def _reshape_dimension(shape: Tuple[int], dim_idx: int, new_dims: Iterable[int]):
+    if isinstance(new_dims, int):
+        new_dims = (new_dims,)
+    if not isinstance(shape, tuple):
+        raise TypeError("shape must be a tuple")
+    if not isinstance(new_dims, (list, tuple)):
+        raise TypeError("new_dims must be a list or a tuple")
+    if dim_idx < 0 or dim_idx >= len(shape):
+        raise IndexError("dim_idx out of range")
+
+    new_shape = shape[:dim_idx] + tuple(new_dims) + shape[dim_idx + 1 :]
+    return new_shape
