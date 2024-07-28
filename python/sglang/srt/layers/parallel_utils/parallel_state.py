@@ -35,6 +35,19 @@ def initialize_model_parallel(
     sequence_parallel_size: int = 1,
     backend: Optional[str] = None,
 ) -> None:
+    """
+    Initialize model parallel groups and sequence parallel groups.
+
+    For sequence parallelism, we partition SP groups within a TP group, and assign
+    gpus with adjacent ranks to the same SP group. For example, with TP size 8
+    and SP size 2, we have 1 TP group and 4 SP groups:
+    SP groups:
+        [g0, g1], [g2, g3], [g4, g5], [g6, g7]
+    Their actual TP rank:
+        [ 0,  0], [ 1,  1], [ 2,  2], [ 3,  3]
+    In this case, we also say that the actual TP size is 4 (8//2), and gpus in each
+    SP group have actual tp rank from 0 to 3.
+    """
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
