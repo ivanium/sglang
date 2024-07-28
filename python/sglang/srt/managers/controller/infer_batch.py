@@ -901,6 +901,9 @@ class InputMetadata:
                 sp_local_token_length = _get_local_token_nums_new(
                     sp_rank, sp_size, extend_seq_lens_cpu
                 )
+            # Convert positions to SP layout
+            normal_to_sp_indices = np.argsort(sp_to_normal_indices)
+            positions = positions[normal_to_sp_indices]
         else:
             sp_to_normal_indices = np.arange(positions.numel())
             _debug_normal_to_sp_metadata = None

@@ -140,7 +140,7 @@ class LlamaAttention(nn.Module):
             is_neox_style=rope_is_neox_style,
         )
         self.attn = RadixAttention(
-            self.num_heads,  # SP will partition the heads of Q
+            self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
@@ -154,28 +154,18 @@ class LlamaAttention(nn.Module):
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
         q, k, v = self.qkv_proj(hidden_states)
-
-        # FIXME (yifan): q and k have different shape here so we need to adapt
-        # the positional embedding part.. Currently this is a quite dirty hack.
+        q, k = self.rotary_emb(positions, q, k)
         if input_metadata.sp_size > 1:
-            # FIXME(yonghao): remove once attn kernel is ready
-            idxs = input_metadata.sp_to_normal_indices
-            q = q[idxs].contiguous()
-            k = k[idxs].contiguous()
-            v = v[idxs].contiguous()
-        q, _ = self.rotary_emb(positions, q, q)
-        _, k = self.rotary_emb(positions, k, k)
-        # q, k = self.rotary_emb(positions, q, k)
-        if input_metadata.sp_size > 1:
-            # FIXME(yonghao): remove once attn kernel is ready
-            qs = []
-            for _, idxs in enumerate(input_metadata._debug_normal_to_sp_metadata):
-                qs.append(q.contiguous().view(-1, self.num_heads, self.head_dim)[idxs])
-            q = qs
             sp_rank = input_metadata.sp_rank
-            idxs = input_metadata._debug_normal_to_sp_metadata[sp_rank]
-            k = k[idxs]
-            v = v[idxs]
+            sp_size = input_metadata.sp_size
+
+            qs = []
+            sp_shard_size = (hidden_states.shape[0] + sp_size - 1) // sp_size
+            for i in range(sp_size):
+                qs.append(q[sp_shard_size * i : sp_shard_size * (i + 1)])
+            q = qs
+            k = k[sp_shard_size * sp_rank : sp_shard_size * (sp_rank + 1)]
+            v = v[sp_shard_size * sp_rank : sp_shard_size * (sp_rank + 1)]
 
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
