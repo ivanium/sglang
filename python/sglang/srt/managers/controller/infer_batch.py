@@ -806,6 +806,8 @@ class InputMetadata:
     flashinfer_prefill_wrapper_ragged: "BatchPrefillWithRaggedKVCacheWrapper" = None
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
+    # NOTE: for sequence parallel, we need to use a dedicated kernel for cross-shard attn.
+    flashinfer_prefill_wrapper_paged_sp: "BatchPrefillWithPagedKVCacheWrapper" = None
 
     # For Sequence Parallel
     sp_rank: int = None
@@ -927,6 +929,7 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
+            flashinfer_prefill_wrapper_paged_sp=model_runner.flashinfer_prefill_wrapper_paged_sp,
             sp_rank=sp_rank,
             sp_size=sp_size,
             sp_to_normal_indices=sp_to_normal_indices,
@@ -962,49 +965,27 @@ def init_flashinfer_args(
     )
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
+    seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
+    prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
 
     if forward_mode == ForwardMode.DECODE:
         paged_kernel_lens = seq_lens
     else:
-        # FIXME (yifan): Simplify the layout adjust code below.
-        seq_lens_cpu = seq_lens.cpu().numpy()
-        prefix_lens_cpu = prefix_lens.cpu().numpy()
-        for i in range(batch_size):
-            seq_len = seq_lens_cpu[i]
-            prefix_len = prefix_lens_cpu[i]
-            seq_lens_cpu[i] = seq_len // model_runner.sp_size + (
-                seq_len % model_runner.sp_size > model_runner.sp_rank
-            )
-            prefix_lens_cpu[i] = prefix_len // model_runner.sp_size + (
-                prefix_len % model_runner.sp_size > model_runner.sp_rank
-            )
-        seq_lens = torch.tensor(seq_lens_cpu, dtype=torch.int32, device="cuda")
-        prefix_lens = torch.tensor(prefix_lens_cpu, dtype=torch.int32, device="cuda")
         paged_kernel_lens = prefix_lens
 
     kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-    # FIXME (yifan): dirty hack for now. With sequence parallel, we will use flashinfer
-    # paged attn kernel for extend phase as well, and we manually initialize kv_indices
-    # here and avoid write to KV cache. Should revise here after having KV cache support.
-    if forward_mode == ForwardMode.DECODE:
-        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
-        paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
-        kv_indices = torch.cat(
-            [
-                model_runner.req_to_token_pool.req_to_token[
-                    req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
-                ]
-                for i in range(batch_size)
-            ],
-            dim=0,
-        ).contiguous()
-    else:
-        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
-        kv_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
-        kv_indices = torch.arange(
-            0, torch.sum(seq_lens), dtype=torch.int32, device="cuda"
-        )
+    req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+    paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+    kv_indices = torch.cat(
+        [
+            model_runner.req_to_token_pool.req_to_token[
+                req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
+            ]
+            for i in range(batch_size)
+        ],
+        dim=0,
+    ).contiguous()
     kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
     if forward_mode == ForwardMode.DECODE:
@@ -1035,6 +1016,37 @@ def init_flashinfer_args(
         # cached part
         model_runner.flashinfer_prefill_wrapper_paged.end_forward()
         model_runner.flashinfer_prefill_wrapper_paged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+        )
+
+    if (
+        model_runner.sp_size > 1 and forward_mode != ForwardMode.DECODE
+    ):  # Sequence parallel enabled.
+        # NOTE (yifan): here we assume that when sequence parallel is enabled,
+        # prefix_lens are always 0s, and we will use flashinfer paged attn kernel
+        # for cross-SP-shard attn computation. If later prefix_lens can be non-0s, (
+        # e.g., extend phases with SP), we will need a dedicate paged attn kernel
+        # wrapper for cross-SP-shard attn.
+        if torch.sum(prefix_lens) != 0:
+            raise ValueError(
+                "Prefix caching with sequence parallelism is not supported."
+            )
+        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+        kv_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+        kv_indices = torch.arange(
+            0, torch.sum(seq_lens - prefix_lens), dtype=torch.int32, device="cuda"
+        )
+
+        # cross-SP-shard extend part
+        model_runner.flashinfer_prefill_wrapper_paged_sp.end_forward()
+        model_runner.flashinfer_prefill_wrapper_paged_sp.begin_forward(
             qo_indptr,
             kv_indptr,
             kv_indices,

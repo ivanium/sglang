@@ -268,7 +268,7 @@ class RadixAttention(nn.Module):
                 q_data = qs[i]
                 kv_data = torch.stack(owned_shards[j], dim=1)
                 o, s = (
-                    input_metadata.flashinfer_prefill_wrapper_paged.forward_return_lse(
+                    input_metadata.flashinfer_prefill_wrapper_paged_sp.forward_return_lse(
                         q_data.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
                         kv_data.contiguous(),
                         causal=False,
