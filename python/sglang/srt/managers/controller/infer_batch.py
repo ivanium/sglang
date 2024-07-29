@@ -4,7 +4,7 @@ import itertools
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Iterable, List, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -903,9 +903,18 @@ class InputMetadata:
                 sp_local_token_length = _get_local_token_nums_new(
                     sp_rank, sp_size, extend_seq_lens_cpu
                 )
-            # Convert positions to SP layout
+            # Convert positions to SP layout and add padding zeros.
             normal_to_sp_indices = np.argsort(sp_to_normal_indices)
             positions = positions[normal_to_sp_indices]
+            positions = _add_padding_zeros(positions, extend_seq_lens_cpu, sp_size)
+            # Add padding zeros to out_cache_loc and write KV of padded tokens
+            # to slot 0 (reserved for dummy output).
+            if (
+                sp_rank == sp_size - 1
+            ):  # Only the last SP shard may contain padding tokens
+                out_cache_loc = _add_padding_zeros(
+                    out_cache_loc, extend_seq_lens_cpu, sp_size, True
+                )
         else:
             sp_to_normal_indices = np.arange(positions.numel())
             _debug_normal_to_sp_metadata = None
@@ -1186,3 +1195,42 @@ def _debug_normal_to_sp(indices, output_tensor, tensor):
         output_tensor[idxs] = tensor
     output_tensor = output_tensor.contiguous()
     return output_tensor
+
+
+def _add_padding_zeros(
+    indices: torch.Tensor, seq_lens, sp_size: int, only_last_shard: bool = False
+):
+    """
+    Add padding zeros to SP-layout indices (must be a 1D tensor) so that the last
+    SP shard will have its sequences padded after each sequence and all SP shards
+    can have the same length.
+
+    This function is used to (1) adjust the positions tensor to align input_ids with
+    their positions during positional encoding and (2) adjust the output cache location
+    to write KV cache of padded tokens to slot 0 (reserved for dummy output).
+    """
+    sp_seq_lens = np.ceil(seq_lens / sp_size).astype(np.int32)
+    last_sp_seq_lens = seq_lens - sp_seq_lens * (sp_size - 1)
+    padded_num_tokens = np.sum(sp_seq_lens).astype(np.int32)
+    if only_last_shard:
+        padded_indices = torch.zeros(
+            padded_num_tokens, dtype=indices.dtype, device=indices.device
+        )
+        padded_stt = stt = 0
+    else:
+        padded_indices = torch.zeros(
+            sp_size * padded_num_tokens, dtype=indices.dtype, device=indices.device
+        )
+        # All non-last shards do not need padding and hence can be copied.
+        padded_stt = padded_num_tokens * (sp_size - 1)
+        stt = padded_stt
+        padded_indices[:padded_stt] = indices[:stt]
+
+    bs = seq_lens.size
+    for i in range(bs):
+        padded_end = padded_stt + sp_seq_lens[i]
+        end = stt + last_sp_seq_lens[i]
+        padded_indices[padded_stt : padded_stt + last_sp_seq_lens[i]] = indices[stt:end]
+        padded_stt = padded_end
+        stt = end
+    return padded_indices
