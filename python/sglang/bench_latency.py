@@ -98,8 +98,8 @@ def load_model(server_args, tp_rank, sp_rank: int = 0):
 def prepare_inputs(bench_args, tokenizer):
     prompts = [
         "The capital of France is",
-        "The capital of the United Kindom",
-        "Today is a sunny day and I like to",
+        "The capital of the United Kindom is",
+        "Today is a sunny day and I like",
     ]
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
