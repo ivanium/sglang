@@ -79,9 +79,13 @@ def get_sequence_parallel_rank():
     return get_sp_group().rank_in_group
 
 
-def get_actual_tensor_model_parallel_world_size():
+# NOTE: For sequence parallelism, we partition Q tensors along the head dimension.
+# But K/V tensors are partitioned along the head dimension in TP and partitioned
+# along the sequence dimensions in SP. Therefore, their TP size and rank is adjusted
+# accordingly as below.
+def get_kv_tensor_model_parallel_world_size():
     return get_tensor_model_parallel_world_size() // get_sequence_parallel_world_size()
 
 
-def get_actual_tensor_model_parallel_rank():
+def get_kv_tensor_model_parallel_rank():
     return get_tensor_model_parallel_rank() // get_sequence_parallel_world_size()
