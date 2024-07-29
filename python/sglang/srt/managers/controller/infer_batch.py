@@ -880,7 +880,6 @@ class InputMetadata:
         sp_rank = model_runner.sp_rank
         sp_size = model_runner.sp_size
         if sp_size > 1:
-            # FIXME: haven't supported cuda graph yet.
             # During the runtime, we should use positions[local_token_indices]
             # to get positions for each SP shard.
             prefix_lens = prefix_lens if prefix_lens is not None else 0
@@ -977,6 +976,7 @@ def init_flashinfer_args(
     )
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
+    prefix_lens = prefix_lens if prefix_lens is not None else torch.zeros_like(seq_lens)
     extend_lens = seq_lens - prefix_lens
     seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
     prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
