@@ -971,7 +971,7 @@ def init_flashinfer_args(
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
     # NOTE (yifan): we partitioned K and V along both TP and SP dimensions.
-    # And here tp_size represents actual TP size * SP size.
+    # And here tp_size represents KV-TP size * SP size.
     num_kv_heads = model_runner.model_config.get_num_kv_heads(
         model_runner.tp_size // model_runner.sp_size
     )

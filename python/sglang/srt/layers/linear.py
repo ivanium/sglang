@@ -8,8 +8,8 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from sglang.srt.layers.parallel_utils.parallel_state import (
-    get_actual_tensor_model_parallel_rank,
-    get_actual_tensor_model_parallel_world_size,
+    get_kv_tensor_model_parallel_rank,
+    get_kv_tensor_model_parallel_world_size,
     get_sequence_parallel_local_rank,
     get_sequence_parallel_world_size,
 )
@@ -144,12 +144,12 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
         self.total_num_heads = total_num_heads
         self.num_heads = divide(total_num_heads, tp_size)
         # num_kv_heads is used for tracking the number of groups in GQA.
-        actual_tp_size = get_actual_tensor_model_parallel_world_size()
-        if actual_tp_size >= self.total_num_kv_heads:
+        kv_tp_size = get_kv_tensor_model_parallel_world_size()
+        if kv_tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(actual_tp_size, self.total_num_kv_heads)
+            self.num_kv_head_replicas = divide(kv_tp_size, self.total_num_kv_heads)
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, actual_tp_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, kv_tp_size)
             self.num_kv_head_replicas = 1
 
         input_size = self.hidden_size
@@ -173,8 +173,8 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
         param: Parameter,
         loaded_weight: torch.Tensor,
     ):
-        actual_tp_rank = get_actual_tensor_model_parallel_rank()
-        actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        kv_tp_rank = get_kv_tensor_model_parallel_rank()
+        kv_tp_size = get_kv_tensor_model_parallel_world_size()
         sp_size = get_sequence_parallel_world_size()
         sp_rank = get_sequence_parallel_local_rank()
 
@@ -184,10 +184,10 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
             shard_size = param_data.shape[output_dim]
             # Load TP weight shard
             tp_shard_size = shard_size * sp_size
-            start_idx = actual_tp_rank * tp_shard_size
+            start_idx = kv_tp_rank * tp_shard_size
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, tp_shard_size)
             # Load SP weight shard
-            tp_num_heads = self.total_num_heads // actual_tp_size
+            tp_num_heads = self.total_num_heads // kv_tp_size
             idxes = torch.tensor(
                 _get_sequence_parallel_head_idxes(
                     tp_num_heads, self.num_kv_heads, sp_rank, sp_size
@@ -260,12 +260,12 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        actual_tp_size = get_actual_tensor_model_parallel_world_size()
-        if actual_tp_size >= self.total_num_kv_heads:
+        kv_tp_size = get_kv_tensor_model_parallel_world_size()
+        if kv_tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(actual_tp_size, self.total_num_kv_heads)
+            self.num_kv_head_replicas = divide(kv_tp_size, self.total_num_kv_heads)
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, actual_tp_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, kv_tp_size)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
         # NOTE: here we use tp_size to make the parent class happy because it
@@ -335,7 +335,7 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
                 self.weight_loader(param, loaded_weight_shard, shard_id)
             return
 
-        actual_tp_rank = get_actual_tensor_model_parallel_rank()
+        kv_tp_rank = get_kv_tensor_model_parallel_rank()
         assert loaded_shard_id in ["k", "v"]
 
         # If output dim is defined, use the default loading process.
@@ -380,7 +380,7 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
                 )
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-            shard_id = actual_tp_rank // self.num_kv_head_replicas
+            shard_id = kv_tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         # Special case for for AQLM codebooks.
@@ -440,8 +440,8 @@ class RowSeqParallelLinear(RowParallelLinear):
         self.head_dim = head_dim
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        actual_tp_rank = get_actual_tensor_model_parallel_rank()
-        actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        kv_tp_rank = get_kv_tensor_model_parallel_rank()
+        kv_tp_size = get_kv_tensor_model_parallel_world_size()
         sp_size = get_sequence_parallel_world_size()
         sp_rank = get_sequence_parallel_local_rank()
 
@@ -451,10 +451,10 @@ class RowSeqParallelLinear(RowParallelLinear):
             shard_size = param_data.shape[input_dim]
             # Load TP weight shard
             tp_shard_size = shard_size * sp_size
-            start_idx = actual_tp_rank * tp_shard_size
+            start_idx = kv_tp_rank * tp_shard_size
             loaded_weight = loaded_weight.narrow(input_dim, start_idx, tp_shard_size)
             # Load SP weight shard
-            tp_num_heads = self.total_num_heads // actual_tp_size
+            tp_num_heads = self.total_num_heads // kv_tp_size
             idxes = torch.tensor(
                 _get_sequence_parallel_head_idxes(
                     tp_num_heads, self.num_kv_heads, sp_rank, sp_size

@@ -148,10 +148,10 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.gpu_id, distributed=self.tp_size > 1
         )
-        # Attention uses both TP and SP -- (actual TP size, SP size)
-        actual_tp_size = self.tp_size // self.sp_size
+        # Attention uses both TP and SP -- (KV-TP size, SP size)
+        kv_tp_size = self.tp_size // self.sp_size
         head_dim = self.model_config.head_dim
-        head_num = self.model_config.get_num_kv_heads(actual_tp_size)
+        head_num = self.model_config.get_num_kv_heads(kv_tp_size)
         cell_size = (
             head_num
             * head_dim
@@ -187,12 +187,12 @@ class ModelRunner:
             self.model_config.context_len + 8,
         )
 
-        # Attention uses both TP and SP -- (actual TP size, SP size)
-        actual_tp_size = self.tp_size // self.sp_size
+        # Attention uses both TP and SP -- (KV-TP size, SP size)
+        kv_tp_size = self.tp_size // self.sp_size
         self.token_to_kv_pool = TokenToKVPool(
             self.max_total_num_tokens,
             dtype=self.dtype,
-            head_num=self.model_config.get_num_kv_heads(actual_tp_size),
+            head_num=self.model_config.get_num_kv_heads(kv_tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
         )

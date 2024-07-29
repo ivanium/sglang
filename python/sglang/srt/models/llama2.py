@@ -30,7 +30,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.linear import QKVParallelLinear, RowSeqParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.parallel_utils.parallel_state import (
-    get_actual_tensor_model_parallel_world_size,
+    get_kv_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
@@ -88,8 +88,8 @@ class LlamaAttention(nn.Module):
         self.hidden_size = hidden_size
         # This is TP_SIZE * SP_SIZE
         tp_size = get_tensor_model_parallel_world_size()
-        # This is the actual TP size
-        actual_tp_size = get_actual_tensor_model_parallel_world_size()
+        # This is the KV-TP size
+        kv_tp_size = get_kv_tensor_model_parallel_world_size()
         # Sequence parallel size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -97,17 +97,17 @@ class LlamaAttention(nn.Module):
         # represents the total TP x SP parallelism.
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        # num_kv_heads is partitioned only by TP so here use actual_tp_size which
-        # represents the actual TP parallelism.
-        if self.total_num_kv_heads >= actual_tp_size:
-            # Number of KV heads is greater than actual TP size, so we partition
+        # num_kv_heads is partitioned only by TP so here use kv_tp_size which
+        # represents the KV-TP parallelism.
+        if self.total_num_kv_heads >= kv_tp_size:
+            # Number of KV heads is greater than KV-TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % actual_tp_size == 0
+            assert self.total_num_kv_heads % kv_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert actual_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // actual_tp_size)
+            assert kv_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // kv_tp_size)
         self.head_dim = hidden_size // self.total_num_heads
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
