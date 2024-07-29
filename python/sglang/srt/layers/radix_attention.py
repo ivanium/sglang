@@ -188,14 +188,6 @@ class RadixAttention(nn.Module):
             v tensor: [batch_size * seq_len // SP_SIZE, v_head_num, head_dim]
         """
 
-        def get_k_shard_shape(token_num, sp_rank, sp_size):
-            sp_token_num = token_num // sp_size + ((token_num % sp_size) > sp_rank)
-            return (sp_token_num, self.tp_k_head_num, self.head_dim)
-
-        def get_v_shard_shape(token_num, sp_rank, sp_size):
-            sp_token_num = token_num // sp_size + ((token_num % sp_size) > sp_rank)
-            return (sp_token_num, self.tp_v_head_num, self.head_dim)
-
         def append_merge_shard(shard_list, o, s):
             if len(shard_list) == 0:
                 shard_list.append((o, s))
@@ -208,7 +200,6 @@ class RadixAttention(nn.Module):
         sp_size = get_sequence_parallel_world_size()
         num_shards = sp_size
         num_iters = sp_size
-        token_num = input_metadata.total_num_tokens
         # k and v should have been sharded and trimmed (padding tokens) here so use them directly.
         local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
         local_v = v.contiguous().view(-1, self.tp_v_head_num, self.head_dim)
@@ -229,24 +220,21 @@ class RadixAttention(nn.Module):
             if rank != from_rank:
                 # reserve space for kv tensors received from other peers
                 owned_shards[from_rank] = (
-                    torch.empty(
-                        get_k_shard_shape(token_num, from_rank, sp_size),
-                        device=local_k.device,
-                        dtype=local_k.dtype,
-                    ),
-                    torch.empty(
-                        get_v_shard_shape(token_num, from_rank, sp_size),
-                        device=local_v.device,
-                        dtype=local_v.dtype,
-                    ),
+                    torch.empty_like(local_k),
+                    torch.empty_like(local_v),
                 )
             comm_reqs = self.launch_sp_comm_ops(
                 owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
             )
             q_shard = qs[sid]
             k_shard, v_shard = owned_shards[sid]
-            # Ragged attention computation for self attention within the shard
-            o, s = input_metadata.flashinfer_prefill_wrapper_ragged.forward_return_lse(
+            # Ragged attention computation for self attention within the shard.
+            attn_wrapper = ( # Only the last SP shard needs a mask.
+                input_metadata.flashinfer_prefill_wrapper_sp_causal
+                if sid == sp_size - 1
+                else input_metadata.flashinfer_prefill_wrapper_ragged
+            )
+            o, s = attn_wrapper.forward_return_lse(
                 q_shard.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
                 k_shard.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
                 v_shard.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
@@ -255,30 +243,34 @@ class RadixAttention(nn.Module):
                 logits_soft_cap=self.logit_cap,
             )
             append_merge_shard(output_shards[sid], o, s)
-            # Paged attention computation for cross shard attention
+            # Paged attention computation for cross shard attention.
             # NOTE: below schedule is for load balancing. Basically, at iteration i,
             # (i starting from 0), each SP worker will run i paged attentions.
             for existing_sid in owned_sids:
                 if existing_sid == sid:
                     continue
-                # Due to the causal nature of the attention, swap pids if necessary
+                # Due to the causal nature of the attention, swap pids if necessary.
                 i, j = (
                     (existing_sid, sid) if existing_sid > sid else (sid, existing_sid)
                 )
-                q_data = qs[i]
-                kv_data = torch.stack(owned_shards[j], dim=1)
-                o, s = (
-                    input_metadata.flashinfer_prefill_wrapper_paged_sp.forward_return_lse(
-                        q_data.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
-                        kv_data.contiguous(),
-                        causal=False,
-                        sm_scale=self.scaling,
-                        logits_soft_cap=self.logit_cap,
-                    )
+                q_shard = qs[i]
+                k_shard, v_shard = owned_shards[j]
+                attn_wrapper = ( # Only the last SP shard needs a mask.
+                    input_metadata.flashinfer_prefill_wrapper_sp_full
+                    if i == sp_size - 1
+                    else input_metadata.flashinfer_prefill_wrapper_ragged
+                )
+                o, s = attn_wrapper.forward_return_lse(
+                    q_shard.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+                    k_shard.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+                    v_shard.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
+                    causal=False,
+                    sm_scale=self.scaling,
+                    logits_soft_cap=self.logit_cap,
                 )
                 append_merge_shard(output_shards[i], o, s)
 
-            # Wait for async communication to complete
+            # Wait for async communication to complete.
             self.wait_sp_comm_ops(comm_reqs)
             if rank != from_rank:
                 owned_sids.append(from_rank)

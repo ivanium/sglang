@@ -216,7 +216,8 @@ class ModelRunner:
             self.flashinfer_prefill_wrapper_paged = None
             self.flashinfer_decode_wrapper = None
             # NOTE: for sequence parallel, we need to use a dedicated kernel for cross-shard attn.
-            self.flashinfer_prefill_wrapper_paged_sp = None
+            self.flashinfer_prefill_wrapper_sp_full = None
+            self.flashinfer_prefill_wrapper_sp_causal = None
             return
 
         if not _grouped_size_compiled_for_decode_kernels(
@@ -227,7 +228,7 @@ class ModelRunner:
         else:
             use_tensor_cores = False
 
-        num_buffers = 2 + (self.sp_size > 1)
+        num_buffers = 2 + (self.sp_size > 1) * 2
         self.flashinfer_workspace_buffers = torch.empty(
             num_buffers,
             global_config.flashinfer_workspace_size,
@@ -246,13 +247,19 @@ class ModelRunner:
             use_tensor_cores=use_tensor_cores,
         )
         if self.sp_size > 1:  # Sequence parallel enabled.
-            self.flashinfer_prefill_wrapper_paged_sp = (
-                BatchPrefillWithPagedKVCacheWrapper(
+            self.flashinfer_prefill_wrapper_sp_full = (
+                BatchPrefillWithRaggedKVCacheWrapper(
                     self.flashinfer_workspace_buffers[2], "NHD"
                 )
             )
+            self.flashinfer_prefill_wrapper_sp_causal = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.flashinfer_workspace_buffers[3], "NHD"
+                )
+            )
         else:
-            self.flashinfer_prefill_wrapper_paged_sp = None
+            self.flashinfer_prefill_wrapper_sp_full = None
+            self.flashinfer_prefill_wrapper_sp_causal = None
 
     def init_cuda_graphs(self):
         from sglang.srt.managers.controller.cuda_graph_runner import CudaGraphRunner

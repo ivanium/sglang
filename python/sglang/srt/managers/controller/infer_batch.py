@@ -806,8 +806,10 @@ class InputMetadata:
     flashinfer_prefill_wrapper_ragged: "BatchPrefillWithRaggedKVCacheWrapper" = None
     flashinfer_prefill_wrapper_paged: "BatchPrefillWithPagedKVCacheWrapper" = None
     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
-    # NOTE: for sequence parallel, we need to use a dedicated kernel for cross-shard attn.
-    flashinfer_prefill_wrapper_paged_sp: "BatchPrefillWithPagedKVCacheWrapper" = None
+    # NOTE: for sequence parallel, we need dedicated kernels for cross-shard attn.
+    # Especially, we need custom masks for the last SP shard which may contain padding tokens.
+    flashinfer_prefill_wrapper_sp_full: "BatchPrefillWithRaggedKVCacheWrapper" = None
+    flashinfer_prefill_wrapper_sp_causal: "BatchPrefillWithRaggedKVCacheWrapper" = None
 
     # For Sequence Parallel
     sp_rank: int = None
@@ -938,7 +940,8 @@ class InputMetadata:
             flashinfer_prefill_wrapper_ragged=model_runner.flashinfer_prefill_wrapper_ragged,
             flashinfer_prefill_wrapper_paged=model_runner.flashinfer_prefill_wrapper_paged,
             flashinfer_decode_wrapper=model_runner.flashinfer_decode_wrapper,
-            flashinfer_prefill_wrapper_paged_sp=model_runner.flashinfer_prefill_wrapper_paged_sp,
+            flashinfer_prefill_wrapper_sp_full=model_runner.flashinfer_prefill_wrapper_sp_full,
+            flashinfer_prefill_wrapper_sp_causal=model_runner.flashinfer_prefill_wrapper_sp_causal,
             sp_rank=sp_rank,
             sp_size=sp_size,
             sp_to_normal_indices=sp_to_normal_indices,
@@ -974,6 +977,7 @@ def init_flashinfer_args(
     )
     head_dim = model_runner.model_config.head_dim
     batch_size = len(req_pool_indices)
+    extend_lens = seq_lens - prefix_lens
     seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
     prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
 
@@ -1047,23 +1051,46 @@ def init_flashinfer_args(
             raise ValueError(
                 "Prefix caching with sequence parallelism is not supported."
             )
-        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
-        kv_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
-        kv_indices = torch.arange(
-            0, torch.sum(seq_lens - prefix_lens), dtype=torch.int32, device="cuda"
-        )
 
-        # cross-SP-shard extend part
-        model_runner.flashinfer_prefill_wrapper_paged_sp.end_forward()
-        model_runner.flashinfer_prefill_wrapper_paged_sp.begin_forward(
+        # Prepare masks.
+        sp_size = model_runner.sp_size
+        extend_lens_cpu = extend_lens.cpu().numpy()
+        padded_extend_lens = _get_local_token_nums_new(0, sp_size, extend_lens_cpu)
+        last_extend_lens = _get_local_token_nums_new(
+            sp_size - 1, sp_size, extend_lens_cpu
+        )
+        qo_len = (seq_lens - prefix_lens).cpu().tolist()
+        full_mask_arr = []
+        causal_mask_arr = []
+        for i in range(batch_size):
+            full_mask_i = torch.full((qo_len[i], qo_len[i]), False, device="cuda")
+            full_mask_i[: last_extend_lens[i], : padded_extend_lens[i]] = True
+            full_mask_arr.append(full_mask_i.flatten())
+            causal_mask_i = torch.tril(full_mask_i, diagonal=0)
+            causal_mask_arr.append(causal_mask_i.flatten())
+        full_mask = torch.cat(full_mask_arr, dim=0)
+        causal_mask = torch.cat(causal_mask_arr, dim=0)
+
+        # Cross-SP-shard extend part -- masked for the last SP shard which may have
+        # padding tokens. For the othe shards, we can simply use the ragged kernel.
+        model_runner.flashinfer_prefill_wrapper_sp_causal.end_forward()
+        model_runner.flashinfer_prefill_wrapper_sp_causal.begin_forward(
             qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
+            qo_indptr,
             num_qo_heads,
             num_kv_heads,
             head_dim,
-            1,
+            custom_mask=causal_mask,
+        )
+
+        model_runner.flashinfer_prefill_wrapper_sp_full.end_forward()
+        model_runner.flashinfer_prefill_wrapper_sp_full.begin_forward(
+            qo_indptr,
+            qo_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            custom_mask=full_mask,
         )
 
 
