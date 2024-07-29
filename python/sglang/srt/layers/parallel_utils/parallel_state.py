@@ -1,86 +1,92 @@
-from typing import Optional
+from typing import List, Optional
 
+import torch
 from vllm.distributed import initialize_model_parallel as vllm_initialize_model_parallel
 from vllm.distributed.parallel_state import (
+    GroupCoordinator,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_world_group,
+    init_model_parallel_group,
 )
 
-_SEQUENCE_PARALLEL_SIZE = None
+_SP: Optional[GroupCoordinator] = None
+
+
+def get_sp_group():
+    assert _SP is not None, "sequence parallel group is not initialized"
+    return _SP
+
+
+def init_sequence_parallel_group(
+    group_ranks: List[List[int]], local_rank: int, backend: str
+) -> GroupCoordinator:
+    return GroupCoordinator(
+        group_ranks=group_ranks,
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_pynccl=True,
+    )
 
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     sequence_parallel_size: int = 1,
+    backend: Optional[str] = None,
 ) -> None:
-    global _SEQUENCE_PARALLEL_SIZE
-    assert _SEQUENCE_PARALLEL_SIZE is None
-    _SEQUENCE_PARALLEL_SIZE = sequence_parallel_size
+    """
+    Initialize model parallel groups and sequence parallel groups.
+
+    For sequence parallelism, we partition SP groups within a TP group, and assign
+    gpus with adjacent ranks to the same SP group. For example, with TP size 8
+    and SP size 2, we have 1 TP group and 4 SP groups:
+    SP groups:
+        [g0, g1], [g2, g3], [g4, g5], [g6, g7]
+    Their actual TP rank:
+        [ 0,  0], [ 1,  1], [ 2,  2], [ 3,  3]
+    In this case, we also say that the actual TP size is 4 (8//2), and gpus in each
+    SP group have actual tp rank from 0 to 3.
+    """
+    assert torch.distributed.is_initialized()
+    world_size: int = torch.distributed.get_world_size()
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    num_sequence_parallel_groups: int = world_size // sequence_parallel_size
+    global _SP
+    assert _SP is None, "sequence parallel group is already initialized"
+    group_ranks = []
+    for i in range(num_sequence_parallel_groups):
+        ranks = list(
+            range(i * sequence_parallel_size, (i + 1) * sequence_parallel_size)
+        )
+        group_ranks.append(ranks)
+    _SP = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend)
     vllm_initialize_model_parallel(
-        tensor_model_parallel_size, pipeline_model_parallel_size
+        tensor_model_parallel_size, pipeline_model_parallel_size, backend
     )
 
 
 def sequence_parallel_is_initialized():
-    return _SEQUENCE_PARALLEL_SIZE is not None
+    return _SP is not None
 
 
 def get_sequence_parallel_world_size():
-    assert _SEQUENCE_PARALLEL_SIZE is not None
-    return _SEQUENCE_PARALLEL_SIZE
+    return get_sp_group().world_size
 
 
-def get_sequence_parallel_local_rank(rank: Optional[int] = None):
-    assert _SEQUENCE_PARALLEL_SIZE is not None
-    if rank is None:
-        rank = get_tensor_model_parallel_rank()
-    local_rank = rank % _SEQUENCE_PARALLEL_SIZE
-    return local_rank
+def get_sequence_parallel_rank():
+    return get_sp_group().rank_in_group
 
 
 def get_sequence_parallel_global_rank():
     return get_tensor_model_parallel_rank()
 
 
-def get_sequence_parallel_first_rank(rank: Optional[int] = None):
-    assert _SEQUENCE_PARALLEL_SIZE is not None
-    if rank is None:
-        rank = get_tensor_model_parallel_rank()
-    first_rank = rank // _SEQUENCE_PARALLEL_SIZE * _SEQUENCE_PARALLEL_SIZE
-    return first_rank
-
-
-def get_sequence_parallel_last_rank(rank: Optional[int] = None):
-    assert _SEQUENCE_PARALLEL_SIZE is not None
-    if rank is None:
-        rank = get_tensor_model_parallel_rank()
-    last_rank = (
-        rank // _SEQUENCE_PARALLEL_SIZE * _SEQUENCE_PARALLEL_SIZE
-        + _SEQUENCE_PARALLEL_SIZE
-        - 1
-    )
-    return last_rank
-
-
-def get_sequence_parallel_next_rank(rank: Optional[int] = None):
-    assert _SEQUENCE_PARALLEL_SIZE is not None
-    if rank is None:
-        rank = get_tensor_model_parallel_rank()
-    first_rank = get_sequence_parallel_first_rank(rank)
-    next_rank = first_rank + (rank + 1) % _SEQUENCE_PARALLEL_SIZE
-    return next_rank
-
-
-def get_sequence_parallel_prev_rank(rank: Optional[int] = None):
-    assert _SEQUENCE_PARALLEL_SIZE is not None
-    if rank is None:
-        rank = get_tensor_model_parallel_rank()
-    first_rank = get_sequence_parallel_first_rank(rank)
-    prev_rank = first_rank + (rank - 1) % _SEQUENCE_PARALLEL_SIZE
-    return prev_rank
-
-
+# NOTE: For sequence parallelism, we partition Q tensors along the head dimension.
+# But K/V tensors are partitioned along the head dimension in TP and partitioned
+# along the sequence dimensions in SP. Therefore, their TP size and rank is adjusted
+# accordingly as below.
 def get_kv_tensor_model_parallel_world_size():
     return get_tensor_model_parallel_world_size() // get_sequence_parallel_world_size()
 

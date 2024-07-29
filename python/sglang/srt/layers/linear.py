@@ -7,10 +7,10 @@ from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from sglang.srt.layers.parallel_utils.parallel_state import (
+from sglang.srt.layers.parallel_utils import (
     get_kv_tensor_model_parallel_rank,
     get_kv_tensor_model_parallel_world_size,
-    get_sequence_parallel_local_rank,
+    get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
 )
 
@@ -176,7 +176,7 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
         kv_tp_rank = get_kv_tensor_model_parallel_rank()
         kv_tp_size = get_kv_tensor_model_parallel_world_size()
         sp_size = get_sequence_parallel_world_size()
-        sp_rank = get_sequence_parallel_local_rank()
+        sp_rank = get_sequence_parallel_rank()
 
         output_dim = getattr(param, "output_dim", None)
         param_data = param.data
@@ -443,7 +443,7 @@ class RowSeqParallelLinear(RowParallelLinear):
         kv_tp_rank = get_kv_tensor_model_parallel_rank()
         kv_tp_size = get_kv_tensor_model_parallel_world_size()
         sp_size = get_sequence_parallel_world_size()
-        sp_rank = get_sequence_parallel_local_rank()
+        sp_rank = get_sequence_parallel_rank()
 
         input_dim = getattr(param, "input_dim", None)
         param_data = param.data

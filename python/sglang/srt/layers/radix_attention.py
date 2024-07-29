@@ -4,15 +4,10 @@ import torch
 from flashinfer.cascade import merge_state
 from torch import nn
 from torch.distributed import P2POp, batch_isend_irecv, irecv, isend
-from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 
 from sglang.global_config import global_config
 from sglang.srt.layers.extend_attention import extend_attention_fwd
-from sglang.srt.layers.parallel_utils.parallel_state import (
-    get_sequence_parallel_next_rank,
-    get_sequence_parallel_prev_rank,
-    get_sequence_parallel_world_size,
-)
+from sglang.srt.layers.parallel_utils import get_sp_group
 from sglang.srt.layers.token_attention import token_attention_fwd
 from sglang.srt.managers.controller.model_runner import ForwardMode, InputMetadata
 from sglang.srt.server import global_server_args_dict
@@ -151,14 +146,14 @@ class RadixAttention(nn.Module):
 
         handles = []
         reqs = []
-        tp_group = get_tp_group().device_group
+        sp_group = get_sp_group().device_group
         # Interleaving workers for send and recv to avoid deadlock
         if my_rank % 2 == 0:
-            _send(handles, tp_group)
-            _recv(handles, tp_group)
+            _send(handles, sp_group)
+            _recv(handles, sp_group)
         else:
-            _recv(handles, tp_group)
-            _send(handles, tp_group)
+            _recv(handles, sp_group)
+            _send(handles, sp_group)
         if handles:
             reqs = batch_isend_irecv(handles)
         return reqs
@@ -245,8 +240,8 @@ class RadixAttention(nn.Module):
         from_rank = sp_rank  # which SP worker to receive the sequence KV shard from.
         sid = sp_rank  # start from the worker's own shard
         for _ in range(num_iters):
-            to_rank = get_sequence_parallel_next_rank(to_rank)
-            from_rank = get_sequence_parallel_prev_rank(from_rank)
+            to_rank = (to_rank + 1) % sp_size
+            from_rank = (from_rank - 1) % sp_size
             if need_comm:  # Launch async communication operations
                 comm_reqs = self.launch_sp_comm_ops(
                     kv_shards[from_rank],

@@ -22,7 +22,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.layers.parallel_utils.parallel_state import initialize_model_parallel
+from sglang.srt.layers.parallel_utils import initialize_model_parallel
 from sglang.srt.managers.controller.infer_batch import Batch, ForwardMode, InputMetadata
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.server_args import ServerArgs

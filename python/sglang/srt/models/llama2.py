@@ -29,9 +29,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.linear import QKVParallelLinear, RowSeqParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.parallel_utils.parallel_state import (
-    get_kv_tensor_model_parallel_world_size,
-)
+from sglang.srt.layers.parallel_utils import get_kv_tensor_model_parallel_world_size
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.controller.model_runner import InputMetadata
 
