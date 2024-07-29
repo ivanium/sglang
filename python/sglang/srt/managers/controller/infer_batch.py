@@ -904,18 +904,16 @@ class InputMetadata:
                 sp_local_token_length = _get_local_token_nums_new(
                     sp_rank, sp_size, extend_seq_lens_cpu
                 )
-            # Convert positions to SP layout and add padding zeros.
-            normal_to_sp_indices = np.argsort(sp_to_normal_indices)
-            positions = positions[normal_to_sp_indices]
-            positions = _add_padding_zeros(positions, extend_seq_lens_cpu, sp_size)
-            # Add padding zeros to out_cache_loc and write KV of padded tokens
-            # to slot 0 (reserved for dummy output).
-            if (
-                sp_rank == sp_size - 1
-            ):  # Only the last SP shard may contain padding tokens
-                out_cache_loc = _add_padding_zeros(
-                    out_cache_loc, extend_seq_lens_cpu, sp_size, True
-                )
+                # Convert positions to SP layout and add padding zeros.
+                normal_to_sp_indices = np.argsort(sp_to_normal_indices)
+                positions = positions[normal_to_sp_indices]
+                positions = _add_padding_zeros(positions, extend_seq_lens_cpu, sp_size)
+                # Add padding zeros to out_cache_loc and write KV of padded tokens that may
+                # exist in the last SP shard to slot 0 (reserved for dummy output).
+                if sp_rank == sp_size - 1:
+                    out_cache_loc = _add_padding_zeros(
+                        out_cache_loc, extend_seq_lens_cpu, sp_size, True
+                    )
         else:
             sp_to_normal_indices = np.arange(positions.numel())
             _debug_normal_to_sp_metadata = None
