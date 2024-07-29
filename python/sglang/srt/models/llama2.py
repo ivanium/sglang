@@ -155,18 +155,6 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         q, k, v = self.qkv_proj(hidden_states)
         q, k = self.rotary_emb(positions, q, k)
-        if input_metadata.sp_size > 1:
-            sp_rank = input_metadata.sp_rank
-            sp_size = input_metadata.sp_size
-
-            qs = []
-            sp_shard_size = (hidden_states.shape[0] + sp_size - 1) // sp_size
-            for i in range(sp_size):
-                qs.append(q[sp_shard_size * i : sp_shard_size * (i + 1)])
-            q = qs
-            k = k[sp_shard_size * sp_rank : sp_shard_size * (sp_rank + 1)]
-            v = v[sp_shard_size * sp_rank : sp_shard_size * (sp_rank + 1)]
-
         attn_output = self.attn(q, k, v, input_metadata)
         output, _ = self.o_proj(attn_output)
         return output
@@ -368,15 +356,3 @@ class LlamaForCausalLM(nn.Module):
 
 
 EntryClass = LlamaForCausalLM
-
-
-def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):
-    group_size = total_num_heads // num_kv_heads
-    shard_num_heads = group_size // sp_size
-
-    idxes = [
-        group_size * i + sp_rank * shard_num_heads + j
-        for i in range(num_kv_heads)
-        for j in range(0, shard_num_heads)
-    ]
-    return idxes

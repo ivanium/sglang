@@ -177,15 +177,21 @@ class RadixAttention(nn.Module):
     ):
         raise NotImplementedError()
 
-    # TODO: fix qs, ks, vs here and should use tensors directly.
     def seq_parallel_extend_forward_flashinfer(
-        self, qs, k, v, input_metadata: InputMetadata
+        self, q, k, v, input_metadata: InputMetadata
     ):
         """Here we adopted a unique parallelization strategy.
-        For each SP worker, we have
-            q tensor: [batch_size * seq_len, q_head_num // SP_SIZE, head_dim]
-            k tensor: [batch_size * seq_len // SP_SIZE, k_head_num, head_dim]
-            v tensor: [batch_size * seq_len // SP_SIZE, v_head_num, head_dim]
+        For each SP worker, we have either (1) QKV of entire sequences:
+            q tensor: [padded_total_num_tokens, q_head_num // SP_SIZE, head_dim]
+            k tensor: [padded_total_num_tokens, k_head_num, head_dim]
+            v tensor: [padded_total_num_tokens, v_head_num, head_dim]
+        Or (2) Q of entire sequences and KV of the current SP shard:
+            q tensor: [padded_total_num_tokens, q_head_num // SP_SIZE, head_dim]
+            k tensor: [padded_sp_shard_num_tokens, k_head_num, head_dim]
+            v tensor: [padded_sp_shard_num_tokens, v_head_num, head_dim]
+
+        Case (1) saves cross-SP-worker communication, while case (2) saves computation
+        to get K and V for entire sequences but need computation in SP attn.
         """
 
         def append_merge_shard(shard_list, o, s):
@@ -196,40 +202,63 @@ class RadixAttention(nn.Module):
                 o, s = merge_state(o_prev, s_prev, o, s)
                 shard_list[-1] = (o, s)
 
-        rank = get_tensor_model_parallel_rank()
-        sp_size = get_sequence_parallel_world_size()
-        num_shards = sp_size
-        num_iters = sp_size
-        # k and v should have been sharded and trimmed (padding tokens) here so use them directly.
-        local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
-        local_v = v.contiguous().view(-1, self.tp_v_head_num, self.head_dim)
+        sp_rank = input_metadata.sp_rank
+        sp_size = input_metadata.sp_size
+        num_shards = num_iters = sp_size
+        sp_shard_size = (q.shape[0] + sp_size - 1) // sp_size
+        assert k.shape[0] == v.shape[0] and (
+            k.shape[0] == q.shape[0] or k.shape[0] == sp_shard_size
+        ), "Invalid K and V partition in sequence parallel."
 
-        owned_sids = [rank]
-        owned_shards = [None for _ in range(num_shards)]
-        owned_shards[rank] = (local_k, local_v)
+        qs = []
+        for i in range(num_shards):
+            qs.append(q[sp_shard_size * i : sp_shard_size * (i + 1)])
+        need_comm = k.shape[0] == sp_shard_size  # Case 2.
+
+        owned_sids = [sp_rank]
+        kv_shards = [None for _ in range(num_shards)]
         output_shards = [[] for _ in range(num_shards)]
 
+        if need_comm:  # We have already got sharded K and V.
+            local_k = k.contiguous().view(-1, self.tp_k_head_num, self.head_dim)
+            local_v = v.contiguous().view(-1, self.tp_v_head_num, self.head_dim)
+            for i in range(sp_size):
+                if i == sp_rank:
+                    kv_shards[i] = (local_k, local_v)
+                else:  # reserve space for kv tensors received from other peers
+                    kv_shards[i] = (
+                        torch.empty_like(local_k),
+                        torch.empty_like(local_v),
+                    )
+        else:  # We need to manually shard K and V.
+            for i in range(num_shards):
+                k_shard = k[sp_shard_size * i : sp_shard_size * (i + 1)]
+                v_shard = v[sp_shard_size * i : sp_shard_size * (i + 1)]
+                kv_shards[i] = (
+                    k_shard.contiguous().view(-1, self.tp_k_head_num, self.head_dim),
+                    v_shard.contiguous().view(-1, self.tp_v_head_num, self.head_dim),
+                )
+            local_k, local_v = kv_shards[sp_rank]
+
         # For communication
-        to_rank = rank  # which SP worker to send my sequence KV shard to.
-        from_rank = rank  # which SP worker to receive the sequence KV shard from.
-        sid = rank  # start from the worker's own shard
+        to_rank = sp_rank  # which SP worker to send my sequence KV shard to.
+        from_rank = sp_rank  # which SP worker to receive the sequence KV shard from.
+        sid = sp_rank  # start from the worker's own shard
         for _ in range(num_iters):
             to_rank = get_sequence_parallel_next_rank(to_rank)
             from_rank = get_sequence_parallel_prev_rank(from_rank)
-            # Launch async communication operations
-            if rank != from_rank:
-                # reserve space for kv tensors received from other peers
-                owned_shards[from_rank] = (
-                    torch.empty_like(local_k),
-                    torch.empty_like(local_v),
+            if need_comm:  # Launch async communication operations
+                comm_reqs = self.launch_sp_comm_ops(
+                    kv_shards[from_rank],
+                    kv_shards[sp_rank],
+                    from_rank,
+                    sp_rank,
+                    to_rank,
                 )
-            comm_reqs = self.launch_sp_comm_ops(
-                owned_shards[from_rank], owned_shards[rank], from_rank, rank, to_rank
-            )
             q_shard = qs[sid]
-            k_shard, v_shard = owned_shards[sid]
+            k_shard, v_shard = kv_shards[sid]
             # Ragged attention computation for self attention within the shard.
-            attn_wrapper = ( # Only the last SP shard needs a mask.
+            attn_wrapper = (  # Only the last SP shard needs a mask.
                 input_metadata.flashinfer_prefill_wrapper_sp_causal
                 if sid == sp_size - 1
                 else input_metadata.flashinfer_prefill_wrapper_ragged
@@ -254,8 +283,8 @@ class RadixAttention(nn.Module):
                     (existing_sid, sid) if existing_sid > sid else (sid, existing_sid)
                 )
                 q_shard = qs[i]
-                k_shard, v_shard = owned_shards[j]
-                attn_wrapper = ( # Only the last SP shard needs a mask.
+                k_shard, v_shard = kv_shards[j]
+                attn_wrapper = (  # Only the last SP shard needs a mask.
                     input_metadata.flashinfer_prefill_wrapper_sp_full
                     if i == sp_size - 1
                     else input_metadata.flashinfer_prefill_wrapper_ragged
@@ -270,18 +299,14 @@ class RadixAttention(nn.Module):
                 )
                 append_merge_shard(output_shards[i], o, s)
 
-            # Wait for async communication to complete.
-            self.wait_sp_comm_ops(comm_reqs)
-            if rank != from_rank:
+            if need_comm:  # Wait for async communication to complete.
+                self.wait_sp_comm_ops(comm_reqs)
+            if sp_rank != from_rank:
                 owned_sids.append(from_rank)
             sid = from_rank
 
         # Concat all output shards along the sequence dimension.
-        os = [
-            o.view(-1, self.tp_q_head_num, self.head_dim)
-            for shard_list in output_shards
-            for o, _ in shard_list
-        ]
+        os = [o for shard_list in output_shards for o, _ in shard_list]
         o = torch.cat(os, dim=0)
 
         self.store_kv_cache(local_k, local_v, input_metadata)
