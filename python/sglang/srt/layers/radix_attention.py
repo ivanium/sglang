@@ -41,6 +41,11 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap if logit_cap is not None and logit_cap > 0 else 0
 
     def extend_forward_triton(self, q, k, v, input_metadata: InputMetadata):
+        if input_metadata.sp_size > 1:
+            raise NotImplementedError(
+                "Sequence parallel is not supported with Triton backend."
+            )
+
         o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
         extend_attention_fwd(
@@ -66,6 +71,11 @@ class RadixAttention(nn.Module):
         return o
 
     def decode_forward_triton(self, q, k, v, input_metadata: InputMetadata):
+        if input_metadata.sp_size > 1:
+            raise NotImplementedError(
+                "Sequence parallel is not supported with Triton backend."
+            )
+
         o = torch.empty_like(q)
         self.store_kv_cache(k, v, input_metadata)
 
@@ -120,6 +130,9 @@ class RadixAttention(nn.Module):
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
     def decode_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+        if input_metadata.sp_size > 1:
+            return self.seq_parallel_decode_forward_flashinfer(q, k, v, input_metadata)
+
         self.store_kv_cache(k, v, input_metadata)
 
         o = input_metadata.flashinfer_decode_wrapper.forward(
@@ -161,16 +174,6 @@ class RadixAttention(nn.Module):
     def wait_sp_comm_ops(self, reqs):
         for req in reqs:
             req.wait()
-
-    def seq_parallel_extend_forward_triton(
-        self, q, k, v, input_metadata: InputMetadata
-    ):
-        raise NotImplementedError()
-
-    def seq_parallel_decode_forward_triton(
-        self, q, k, v, input_metadata: InputMetadata
-    ):
-        raise NotImplementedError()
 
     def seq_parallel_extend_forward_flashinfer(
         self, q, k, v, input_metadata: InputMetadata
@@ -315,7 +318,7 @@ class RadixAttention(nn.Module):
         self, q, k, v, input_metadata: InputMetadata
     ):
         # TODO: implementation
-        raise NotImplementedError()
+        raise NotImplementedError("Sequence parallel decode is not supported.")
 
     def forward(self, q, k, v, input_metadata: InputMetadata):
         k = k.view(-1, self.tp_k_head_num, self.head_dim)
