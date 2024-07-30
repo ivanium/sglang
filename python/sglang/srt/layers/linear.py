@@ -1,10 +1,16 @@
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L1
 import logging
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    adjust_marlin_shard,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from sglang.srt.layers.parallel_utils import (
@@ -17,18 +23,6 @@ from sglang.srt.layers.parallel_utils import (
 logger = logging.getLogger(__name__)
 
 
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L21
-def adjust_marlin_shard(param, shard_size, shard_offset):
-    marlin_tile_size = getattr(param, "marlin_tile_size", None)
-    if marlin_tile_size is None:
-        return shard_size, shard_offset
-
-    return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
-
-
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L29
 def adjust_bitsandbytes_shard(
     param: Parameter, kv_offsets: Dict[str, Tuple[int, int]], loaded_shard_id: str
 ) -> Tuple[int, int]:
@@ -44,8 +38,6 @@ def adjust_bitsandbytes_shard(
     return quantized_size, quantized_offset
 
 
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L44
 def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
     """For fused modules (KV) we have an array of length
     N that holds 1 scale for each "logical" matrix. So the param
@@ -53,10 +45,10 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
     one of the shards on disk. Here, we slice the param based on
     the shard_id for loading.
     """
-    qkv_idxs = {"k": 0, "v": 1}
+    kv_idxs = {"k": 0, "v": 1}
 
     if isinstance(shard_id, str):
-        shard_id = qkv_idxs[shard_id]
+        shard_id = kv_idxs[shard_id]
     elif not isinstance(shard_id, int):
         raise ValueError(f"Unknown Shard Id {shard_id}")
 
@@ -82,10 +74,9 @@ class QKVParallelLinear(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        # FIXME (yifan): output_size should be head_size * total_num_heads // sp_size.
-        # We probably need to manually partition the q_proj in this case since RowPrallelLinear
-        # will perform all-gather after the computation.
-        # q projection can be naively tensor parallelized
+        # q projection can be naively tensor parallelized. However, to adapt to
+        # GQA, we need to manually partition q heads for sequence parallelism.
+        # See _get_sequence_parallel_head_idxes() for details.
         self.q_proj = ColumnSeqParallelLinear(
             hidden_size,
             head_size,
@@ -120,8 +111,6 @@ class QKVParallelLinear(torch.nn.Module):
         return q, k, v
 
 
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L191
 class ColumnSeqParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
@@ -154,7 +143,7 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
 
         input_size = self.hidden_size
         # NOTE: here we use total_num_heads to make the parent class happy because
-        # it expects pure tensor parallelism along the num_heads dimension. output_size
+        # it expects pure tensor parallelism along the heads dimension. output_size
         # here is the total size of all TP and SP workers.
         output_size = self.total_num_heads * self.head_size
 
@@ -406,8 +395,6 @@ class KVSequenceParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L660
 class RowSeqParallelLinear(RowParallelLinear):
     """TODO: add doc string."""
 
