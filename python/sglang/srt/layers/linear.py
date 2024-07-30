@@ -88,7 +88,7 @@ class QKVParallelLinear(torch.nn.Module):
             quant_config,
         )
         # kv projection needs both tensor and sequence parallelization
-        self.kv_proj = KVSequenceParallelLinear(
+        self.kv_proj = KVSeqParallelLinear(
             hidden_size,
             head_size,
             total_num_heads,
@@ -198,8 +198,6 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
-            if sp_size > 1:
-                raise NotImplementedError("Loading scales off disk is not supported.")
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
@@ -208,7 +206,7 @@ class ColumnSeqParallelLinear(ColumnParallelLinear):
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/layers/linear.py#L422
-class KVSequenceParallelLinear(ColumnParallelLinear):
+class KVSeqParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's KV transformation.
 
     Linear layers for the linear transformation of the key, and value
@@ -462,8 +460,6 @@ class RowSeqParallelLinear(RowParallelLinear):
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
-            if sp_size > 1:
-                raise NotImplementedError("Loading scales off disk is not supported.")
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
