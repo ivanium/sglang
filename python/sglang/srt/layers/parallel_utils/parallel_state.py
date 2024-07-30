@@ -43,10 +43,10 @@ def initialize_model_parallel(
     and SP size 2, we have 1 TP group and 4 SP groups:
     SP groups:
         [g0, g1], [g2, g3], [g4, g5], [g6, g7]
-    Their actual TP rank:
+    Their KV TP rank:
         [ 0,  0], [ 1,  1], [ 2,  2], [ 3,  3]
-    In this case, we also say that the actual TP size is 4 (8//2), and gpus in each
-    SP group have actual tp rank from 0 to 3.
+    Given that we replicate KV heads within the same seq parallel group, we also say that
+    the KV TP size is 4 (8//2), and gpus in each SP group have KV-tp rank from 0 to 3.
     """
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -62,6 +62,7 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
     _SP = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend)
+
     vllm_initialize_model_parallel(
         tensor_model_parallel_size, pipeline_model_parallel_size, backend
     )
