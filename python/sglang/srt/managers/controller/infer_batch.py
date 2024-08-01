@@ -976,12 +976,16 @@ def init_flashinfer_args(
     batch_size = len(req_pool_indices)
     prefix_lens = prefix_lens if prefix_lens is not None else torch.zeros_like(seq_lens)
     extend_lens = seq_lens - prefix_lens
-    seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
-    prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
 
     if forward_mode == ForwardMode.DECODE:
+        seq_lens = _get_local_token_nums_new(
+            model_runner.sp_rank, model_runner.sp_size, seq_lens.cpu().numpy()
+        )
+        prefix_lens = torch.zeros_like(seq_lens)
         paged_kernel_lens = seq_lens
     else:
+        seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
+        prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
         paged_kernel_lens = prefix_lens
 
     kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")

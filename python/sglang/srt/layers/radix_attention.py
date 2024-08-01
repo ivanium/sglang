@@ -317,8 +317,46 @@ class RadixAttention(nn.Module):
     def seq_parallel_decode_forward_flashinfer(
         self, q, k, v, input_metadata: InputMetadata
     ):
-        # TODO: implementation
-        raise NotImplementedError("Sequence parallel decode is not supported.")
+        sp_size = input_metadata.sp_size
+        sp_rank = input_metadata.sp_rank
+
+        # FIXME (yifan): to be enabled after we have out_cache_loc ready.
+        if False:
+            sp_store_seqs = np.nonzero(extend_seq_lens_cpu % sp_size == sp_rank)[0]
+            cache_k = k[sp_store_seqs]
+            cache_v = v[sp_store_seqs]
+            self.store_kv_cache(cache_k, cache_v, input_metadata.out_cache_loc)
+
+        # Convert Q back by gathering all TP heads.
+        gathered_q = get_sp_group().all_gather(q.view(1, *q.shape), dim=0)
+        total_num_heads = self.tp_q_head_num * sp_size
+        q = torch.empty_like(gathered_q).view(-1, total_num_heads, self.head_dim)
+        for i in range(sp_size):
+            idxs = _get_sequence_parallel_head_idxes(
+                total_num_heads, self.tp_k_head_num, i, sp_size
+            )
+            q[:, idxs] = gathered_q[i]
+
+        o, s = input_metadata.flashinfer_decode_wrapper.forward_return_lse(
+            q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+            sm_scale=self.scaling,
+            logits_soft_cap=self.logit_cap,
+        )
+
+        os = get_sp_group().all_gather(o.view(1, *o.shape), dim=0)
+        ss = get_sp_group().all_gather(s.view(1, *s.shape), dim=0)
+        for i in range(sp_size):
+            if i != sp_rank:
+                o, s = merge_state(os[i], ss[i], o, s)
+
+        # Partition the output again along the head dimension.
+        idxs = _get_sequence_parallel_head_idxes(
+            total_num_heads, self.tp_k_head_num, sp_rank, sp_size
+        )
+        o = o[:, idxs]
+
+        return o.view(-1, self.tp_q_head_num * self.head_dim)
 
     def forward(self, q, k, v, input_metadata: InputMetadata):
         k = k.view(-1, self.tp_k_head_num, self.head_dim)
@@ -360,3 +398,15 @@ except:
     ) -> None:
         kv_cache[cache_loc, 0] = k
         kv_cache[cache_loc, 1] = v
+
+
+def _get_sequence_parallel_head_idxes(total_num_heads, num_kv_heads, sp_rank, sp_size):
+    group_size = total_num_heads // num_kv_heads
+    shard_num_heads = group_size // sp_size
+
+    idxes = [
+        group_size * i + sp_rank * shard_num_heads + j
+        for i in range(num_kv_heads)
+        for j in range(0, shard_num_heads)
+    ]
+    return idxes
