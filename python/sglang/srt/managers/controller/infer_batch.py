@@ -631,7 +631,7 @@ class Batch:
         self.prefix_lens = None
         # FIXME: the layout here is inconsistent with the batch size, right now
         # below is a dirty hack.
-        self.input_ids = self.input_ids[:len(self.reqs)]
+        self.input_ids = self.input_ids[: len(self.reqs)]
 
         # Alloc mem
         bs = len(self.reqs)
