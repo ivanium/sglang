@@ -629,6 +629,9 @@ class Batch:
             flatten_input_ids, dtype=torch.int32, device="cuda"
         )
         self.prefix_lens = None
+        # FIXME: the layout here is inconsistent with the batch size, right now
+        # below is a dirty hack.
+        self.input_ids = self.input_ids[:len(self.reqs)]
 
         # Alloc mem
         bs = len(self.reqs)
@@ -637,7 +640,7 @@ class Batch:
                 self.sp_rank, self.sp_size, seq_lens_cpu
             )
             # FIXME(yonghao): _bs -> bs once SP kv cache store is ready
-            _bs = len(sp_local_indices)
+            bs = len(sp_local_indices)
 
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
@@ -646,7 +649,7 @@ class Batch:
             self.tree_cache.pretty_print()
             exit()
 
-        if self.sp_size > 1 and False:
+        if self.sp_size > 1:
             # FIXME(yonghao): enable remove it once SP kv cache store is ready
             local_req_indices = self.req_pool_indices[sp_local_indices]
             # NOTE(yonghao): here the seqlen is still the total seq len but not
@@ -978,10 +981,14 @@ def init_flashinfer_args(
     extend_lens = seq_lens - prefix_lens
 
     if forward_mode == ForwardMode.DECODE:
-        seq_lens = _get_local_token_nums_new(
-            model_runner.sp_rank, model_runner.sp_size, seq_lens.cpu().numpy()
-        )
-        prefix_lens = torch.zeros_like(seq_lens)
+        sp_rank = model_runner.sp_rank
+        sp_size = model_runner.sp_size
+        sp_seq_lens = torch.ceil(seq_lens / sp_size).to(torch.int32)
+        if sp_rank != sp_size - 1:
+            seq_lens = sp_seq_lens
+        else:
+            seq_lens = seq_lens - sp_rank * sp_seq_lens
+
         paged_kernel_lens = seq_lens
     else:
         seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
@@ -1004,6 +1011,9 @@ def init_flashinfer_args(
     kv_last_page_len = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
 
     if forward_mode == ForwardMode.DECODE:
+        # For decode, we replicate the current token across SP workers and hence
+        # each SP worker will have all q heads.
+        num_qo_heads *= model_runner.sp_size
         flashinfer_decode_wrapper.end_forward()
         flashinfer_decode_wrapper.begin_forward(
             kv_indptr,

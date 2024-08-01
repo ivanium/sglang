@@ -319,8 +319,9 @@ class RadixAttention(nn.Module):
     ):
         sp_size = input_metadata.sp_size
         sp_rank = input_metadata.sp_rank
+        total_num_heads = self.tp_q_head_num * sp_size
 
-        # FIXME (yifan): to be enabled after we have out_cache_loc ready.
+        # FIXME: to be enabled after we have out_cache_loc ready.
         if False:
             sp_store_seqs = np.nonzero(extend_seq_lens_cpu % sp_size == sp_rank)[0]
             cache_k = k[sp_store_seqs]
@@ -328,8 +329,8 @@ class RadixAttention(nn.Module):
             self.store_kv_cache(cache_k, cache_v, input_metadata.out_cache_loc)
 
         # Convert Q back by gathering all TP heads.
+        q = q.contiguous().view(-1, self.tp_q_head_num, self.head_dim)
         gathered_q = get_sp_group().all_gather(q.view(1, *q.shape), dim=0)
-        total_num_heads = self.tp_q_head_num * sp_size
         q = torch.empty_like(gathered_q).view(-1, total_num_heads, self.head_dim)
         for i in range(sp_size):
             idxs = _get_sequence_parallel_head_idxes(
@@ -338,7 +339,7 @@ class RadixAttention(nn.Module):
             q[:, idxs] = gathered_q[i]
 
         o, s = input_metadata.flashinfer_decode_wrapper.forward_return_lse(
-            q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+            q.contiguous().view(-1, total_num_heads, self.head_dim),
             input_metadata.token_to_kv_pool.kv_data[self.layer_id],
             sm_scale=self.scaling,
             logits_soft_cap=self.logit_cap,
