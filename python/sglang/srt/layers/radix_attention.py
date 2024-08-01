@@ -144,7 +144,21 @@ class RadixAttention(nn.Module):
 
         return o.view(-1, self.tp_q_head_num * self.head_dim)
 
-    def launch_sp_comm_ops(self, kv_to_recv, kv_to_send, from_rank, my_rank, to_rank):
+    def launch_sp_comm_ops(
+        self, kv_to_recv, kv_to_send, from_rank, to_rank, my_rank, sp_size, itr
+    ):
+        # Interleaving workers for send and recv to avoid deadlock
+        def _send_first():
+            flags = [None for _ in range(sp_size)]
+            for _rank in range(sp_size):
+                _next = _rank
+                flag = True
+                while flags[_next] is None:
+                    flags[_next] = flag
+                    _next = (_next + itr) % sp_size
+                    flag = not flag
+            return flags[my_rank]
+
         def _send(handles, group):
             if my_rank != to_rank:
                 for t in kv_to_send:
@@ -160,8 +174,8 @@ class RadixAttention(nn.Module):
         handles = []
         reqs = []
         sp_group = get_sp_group().device_group
-        # Interleaving workers for send and recv to avoid deadlock
-        if my_rank % 2 == 0:
+
+        if _send_first():
             _send(handles, sp_group)
             _recv(handles, sp_group)
         else:
@@ -242,7 +256,7 @@ class RadixAttention(nn.Module):
         to_rank = sp_rank  # which SP worker to send my sequence KV shard to.
         from_rank = sp_rank  # which SP worker to receive the sequence KV shard from.
         sid = sp_rank  # start from the worker's own shard
-        for _ in range(num_iters):
+        for itr in range(num_iters):
             to_rank = (to_rank + 1) % sp_size
             from_rank = (from_rank - 1) % sp_size
             if need_comm:  # Launch async communication operations
@@ -250,8 +264,10 @@ class RadixAttention(nn.Module):
                     kv_shards[from_rank],
                     kv_shards[sp_rank],
                     from_rank,
-                    sp_rank,
                     to_rank,
+                    sp_rank,
+                    sp_size,
+                    itr,
                 )
             q_shard = qs[sid]
             k_shard, v_shard = kv_shards[sid]
