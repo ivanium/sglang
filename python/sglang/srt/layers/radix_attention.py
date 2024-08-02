@@ -337,12 +337,12 @@ class RadixAttention(nn.Module):
         sp_rank = input_metadata.sp_rank
         total_num_heads = self.tp_q_head_num * sp_size
 
-        # FIXME: to be enabled after we have out_cache_loc ready.
-        if False:
-            sp_store_seqs = np.nonzero(extend_seq_lens_cpu % sp_size == sp_rank)[0]
-            cache_k = k[sp_store_seqs]
-            cache_v = v[sp_store_seqs]
-            self.store_kv_cache(cache_k, cache_v, input_metadata.out_cache_loc)
+        sp_offset = input_metadata.sp_local_token_offset
+        sp_len = input_metadata.sp_local_token_length
+        sp_slice = slice(sp_offset, sp_offset + sp_len)
+        cache_k = k[sp_slice]
+        cache_v = v[sp_slice]
+        self.store_kv_cache(cache_k, cache_v, input_metadata)
 
         # Convert Q back by gathering all TP heads.
         q = q.contiguous().view(-1, self.tp_q_head_num, self.head_dim)
