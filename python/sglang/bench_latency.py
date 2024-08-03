@@ -49,8 +49,7 @@ from sglang.srt.utils import suppress_other_loggers
 class BenchArgs:
     batch_size: int = 1
     input_len: int = 1024
-    # FIXME (yifan): output_len was 4 but to be reverted after we support KV cache store in decode phase
-    output_len: int = 1
+    output_len: int = 4
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
