@@ -161,19 +161,33 @@ class RadixAttention(nn.Module):
 
         def _send(handles, group):
             if my_rank != to_rank:
+                to_global_rank = group.first_rank + to_rank
                 for t in kv_to_send:
-                    handles.append(P2POp(op=isend, tensor=t, peer=to_rank, group=group))
+                    handles.append(
+                        P2POp(
+                            op=isend,
+                            tensor=t,
+                            peer=to_global_rank,
+                            group=group.device_group,
+                        )
+                    )
 
         def _recv(handles, group):
             if my_rank != from_rank:
+                from_global_rank = group.first_rank + from_rank
                 for t in kv_to_recv:
                     handles.append(
-                        P2POp(op=irecv, tensor=t, peer=from_rank, group=group)
+                        P2POp(
+                            op=irecv,
+                            tensor=t,
+                            peer=from_global_rank,
+                            group=group.device_group,
+                        )
                     )
 
         handles = []
         reqs = []
-        sp_group = get_sp_group().device_group
+        sp_group = get_sp_group()
 
         if _send_first():
             _send(handles, sp_group)
