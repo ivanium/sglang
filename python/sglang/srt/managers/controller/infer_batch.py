@@ -846,16 +846,6 @@ class InputMetadata:
         return_logprob=False,
         skip_flashinfer_init=False,
     ):
-        if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
-            init_flashinfer_args(
-                forward_mode,
-                model_runner,
-                req_pool_indices,
-                seq_lens,
-                prefix_lens,
-                model_runner.flashinfer_decode_wrapper,
-            )
-
         batch_size = len(req_pool_indices)
 
         if forward_mode == ForwardMode.DECODE:
@@ -910,6 +900,9 @@ class InputMetadata:
                 sp_local_token_offset = _decode_sp_offset(
                     sp_rank, sp_size, extend_seq_lens_cpu
                 )
+                # Convert positions to SP layout and add padding zeros.
+                normal_to_sp_indices = np.argsort(sp_to_normal_indices)
+                positions = positions[normal_to_sp_indices]
             else:
                 sp_to_normal_indices = sp_to_normal_indices_prefill(
                     sp_size, extend_seq_lens_cpu
@@ -935,6 +928,7 @@ class InputMetadata:
                     )
         else:
             sp_to_normal_indices = np.arange(positions.numel())
+            normal_to_sp_indices = np.arange(positions.numel())
             _debug_normal_to_sp_metadata = None
             sp_local_token_length = positions.numel()
             sp_local_token_offset = 0
@@ -967,6 +961,17 @@ class InputMetadata:
             _debug_normal_to_sp_metadata=_debug_normal_to_sp_metadata,
         )
 
+        if not skip_flashinfer_init and not model_runner.server_args.disable_flashinfer:
+            init_flashinfer_args(
+                forward_mode,
+                model_runner,
+                req_pool_indices,
+                seq_lens,
+                prefix_lens,
+                model_runner.flashinfer_decode_wrapper,
+                normal_to_sp_indices,
+            )
+
         if model_runner.server_args.disable_flashinfer:
             (
                 ret.triton_max_seq_len,
@@ -985,6 +990,7 @@ def init_flashinfer_args(
     seq_lens,
     prefix_lens,
     flashinfer_decode_wrapper,
+    normal_to_sp_indices,
 ):
     """Init auxiliary variables for FlashInfer attention backend."""
     num_qo_heads = model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -1007,10 +1013,14 @@ def init_flashinfer_args(
         else:
             seq_lens = seq_lens - sp_rank * sp_seq_lens
 
+        seq_lens = seq_lens[normal_to_sp_indices]
+        req_ids = normal_to_sp_indices.tolist()
         paged_kernel_lens = seq_lens
     else:
         seq_lens = torch.ceil(seq_lens / model_runner.sp_size).to(torch.int32)
         prefix_lens = torch.ceil(prefix_lens / model_runner.sp_size).to(torch.int32)
+
+        req_ids = list(range(batch_size))
         paged_kernel_lens = prefix_lens
 
     kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
@@ -1022,7 +1032,7 @@ def init_flashinfer_args(
             model_runner.req_to_token_pool.req_to_token[
                 req_pool_indices_cpu[i], : paged_kernel_lens_cpu[i]
             ]
-            for i in range(batch_size)
+            for i in req_ids
         ],
         dim=0,
     ).contiguous()
