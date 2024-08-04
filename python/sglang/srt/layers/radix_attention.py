@@ -375,12 +375,17 @@ class RadixAttention(nn.Module):
             logits_soft_cap=self.logit_cap,
         )
 
+        # TODO: in fact we can use all-to-all to gather the output and state here
+        # to collect only q head shards that are needed by the current SP worker.
+        # All-to-all will save communication and `merge_state` computation.
         os = get_sp_group().all_gather(o.view(1, *o.shape), dim=0)
         ss = get_sp_group().all_gather(s.view(1, *s.shape), dim=0)
         for i in range(sp_size):
             if i != sp_rank:
                 o, s = merge_state(os[i], ss[i], o, s)
 
+        # TODO: consequently, if we use all-to-all rather than all-gather, we don't
+        # need to partition the output again along the head dimension.
         # Partition the output again along the head dimension.
         idxs = _get_sequence_parallel_head_idxes(
             total_num_heads, self.tp_k_head_num, sp_rank, sp_size
