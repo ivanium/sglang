@@ -782,7 +782,16 @@ class Batch:
         else:
             extend_size = extend_lens - extend_chunk_size * (sp_size - 1)
         # note that sp_len (as well as decode_lens) already increased 1.
-        decode_size = decode_lens // sp_size + self.sp_rank < (decode_lens % sp_size)
+        # NOTE: for decoding tokens, assume there's no prefix, they are located:
+        # dec token 0 = all token [extend_lens] = stored at extend_lens % sp
+        # decode token i = stored at (extend_lens + i) % sp
+        # Hence, for the remainder tokens, they are stored at extend_lens % sp,
+        # extend_lens % sp + 1, ...
+        # For example, if sp = 4, extend lens = 6, the first decode remainder
+        # token is at rank 3 (7 % 4)
+        decode_extra_tok_offset = (self.sp_rank - extend_lens) % sp_size
+        decode_extra_tok = decode_extra_tok_offset <= (decode_lens % sp_size)
+        decode_size = decode_lens // sp_size + decode_extra_tok
         return extend_size + decode_size
 
 
