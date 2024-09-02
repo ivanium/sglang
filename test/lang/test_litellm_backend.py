@@ -6,12 +6,15 @@ from sglang.test.test_programs import test_mt_bench, test_stream
 
 
 class TestAnthropicBackend(unittest.TestCase):
+    backend = None
     chat_backend = None
 
-    @classmethod
-    def setUpClass(cls):
-        cls.chat_backend = LiteLLM("gpt-3.5-turbo")
-        set_default_backend(cls.chat_backend)
+    def setUp(self):
+        cls = type(self)
+
+        if cls.backend is None:
+            cls.backend = LiteLLM("gpt-3.5-turbo")
+            set_default_backend(cls.backend)
 
     def test_mt_bench(self):
         test_mt_bench()
@@ -21,4 +24,4 @@ class TestAnthropicBackend(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(warnings="ignore")

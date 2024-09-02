@@ -288,7 +288,6 @@ class StreamExecutor:
             exes[i].text_ = str(self.text_)
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
-            exes[i].cur_role_begin_pos = self.cur_role_begin_pos
             exes[i].fork_start_text_pos = len(self.text_)
             exes[i].images_ = list(self.images_)
 
@@ -538,17 +537,22 @@ class StreamExecutor:
             self.stream_var_event[name].set()
 
     def _execute_select(self, expr: SglSelect):
-        choices_decision = self.backend.select(
-            self, expr.choices, expr.temperature, expr.choices_method
-        )
+        (
+            decision,
+            normalized_prompt_logprobs,
+            prefill_token_logprobs,
+            decode_token_logprobs,
+        ) = self.backend.select(self, expr.choices, expr.temperature)
         if expr.name is not None:
             name = expr.name
-            self.variables[name] = choices_decision.decision
-            self.meta_info[name] = choices_decision.meta_info
+            self.variables[name] = decision
+            self.meta_info[name] = {
+                "normalized_prompt_logprobs": normalized_prompt_logprobs,
+                "prefill_token_logprobs": prefill_token_logprobs,
+                "decode_token_logprobs": decode_token_logprobs,
+            }
             self.variable_event[name].set()
-            if self.stream_var_event:
-                self.stream_var_event[name].set()
-        self.text_ += choices_decision.decision
+        self.text_ += decision
 
     def _execute_variable(self, expr: SglVariable):
         src_executor = expr.source_stream_executor
@@ -700,9 +704,9 @@ class ProgramState:
 
     def _role_common(self, name: str, expr: Optional[SglExpr] = None):
         if expr is not None:
-            role_expr = SglExprList([SglRoleBegin(name), expr, SglRoleEnd(name)])
-            self.stream_executor.submit(role_expr)
-            return role_expr
+            self.stream_executor.submit(
+                SglExprList([SglRoleBegin(name), expr, SglRoleEnd(name)])
+            )
         else:
 
             @contextmanager
@@ -773,14 +777,7 @@ class ProgramState:
                     if self.stream_executor.is_finished:
                         break
             else:
-                event = None
-                while not event:
-                    if var_name in self.stream_executor.stream_var_event:
-                        event = self.stream_executor.stream_var_event[var_name]
-                    if self.stream_executor.is_finished:
-                        yield ""
-                        return
-
+                event = self.stream_executor.stream_var_event[var_name]
                 while True:
                     event.wait()
                     event.clear()
@@ -815,14 +812,7 @@ class ProgramState:
                     if self.stream_executor.is_finished:
                         break
             else:
-                event = None
-                while not event:
-                    if var_name in self.stream_executor.stream_var_event:
-                        event = self.stream_executor.stream_var_event[var_name]
-                    if self.stream_executor.is_finished:
-                        yield ""
-                        return
-
+                event = self.stream_executor.stream_var_event[var_name]
                 while True:
                     await loop.run_in_executor(None, event.wait)
                     event.clear()

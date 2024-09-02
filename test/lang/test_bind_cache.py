@@ -1,20 +1,17 @@
 import unittest
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+from sglang.backend.runtime_endpoint import RuntimeEndpoint
 
 
 class TestBind(unittest.TestCase):
     backend = None
 
-    @classmethod
-    def setUpClass(cls):
-        cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
-        sgl.set_default_backend(cls.backend)
+    def setUp(self):
+        cls = type(self)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.backend.shutdown()
+        if cls.backend is None:
+            cls.backend = RuntimeEndpoint(base_url="http://localhost:30000")
 
     def test_bind(self):
         @sgl.function
@@ -48,4 +45,8 @@ class TestBind(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(warnings="ignore")
+
+    # t = TestBind()
+    # t.setUp()
+    # t.test_cache()
